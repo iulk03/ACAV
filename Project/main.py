@@ -79,15 +79,42 @@ def calcola_trapezio(calib, x_range=X_RANGE, z_range=Z_RANGE):
         proietta(x_range[0], z_range[1]),          # lontano, sinistra (in alto)
     ])
  
- 
 def applica_roi(img, trapezio):
     """Scarta tutto cio' che sta fuori dal trapezio (cielo, edifici, bordi)."""
     maschera = np.zeros(img.shape[:2], dtype=np.uint8)
     cv2.fillPoly(maschera, [trapezio.astype(np.int32)], 255)   # dentro = bianco
     return cv2.bitwise_and(img, img, mask=maschera)            # fuori = nero
 
+def brid_eye_view(img, trapezio, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
+    """Trasforma la prospettiva dell'immagine in una vista dall'alto (bird-eye view)."""
+    # dimensioni della bird-eye view in pixel
+    width = int((x_range[1] - x_range[0]) * px_per_m)
+    height = int((z_range[1] - z_range[0]) * px_per_m)
+    trapezio_dst = np.float32([[0, height], [width, height], [width, 0], [0, 0]])  # rettangolo in alto
+    M = cv2.getPerspectiveTransform(trapezio, trapezio_dst)      # matrice di trasformazione
+    M_inv = cv2.getPerspectiveTransform(trapezio_dst, trapezio)  # matrice inversa
+    bew =  cv2.warpPerspective(img, M, (width, height))
+    return bew, M, M_inv
 
-IMAGE_INDEX = 34
+#segmentation 
+def gaussian_filter(img, ksize=GAUSS_KSIZE):
+    grey = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    return cv2.GaussianBlur(grey, (ksize, ksize), 0)
+
+def gradient_filter(img):
+    """Calcola il gradiente orizzontale e verticale, e restituisce la magnitudine."""
+    gx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)  # gradiente orizzontale
+    gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)  # gradiente verticale
+    return np.sqrt(gx**2 + gy**2)               # magnitudine del gradiente
+
+def treshold(img, k=SOGLIA_K):
+    """Soglia: media + k * deviazione standard."""
+    mean = np.mean(img)
+    std = np.std(img)
+    treshold = mean + k * std
+    return (img > treshold).astype(np.uint8) * 255
+
+IMAGE_INDEX = 53
 image_path = Path(um[IMAGE_INDEX])
 
 img = cv2.imread(str(image_path))
@@ -97,15 +124,19 @@ calib_path = root / "training" / "calib" / f"{image_path.stem}.txt"
 calib = leggi_calib(calib_path)
 trapezio = calcola_trapezio(calib)
 img_roi = applica_roi(img, trapezio)
+img_bird_eye, M, M_inv = brid_eye_view(img_roi, trapezio)
+img_filtered = gaussian_filter(img_bird_eye)
+img_grad = gradient_filter(img_filtered)
+img_thresh = treshold(img_grad)
 
 # Visualizzo
 vis = img.copy()
 cv2.polylines(vis, [trapezio.astype("int32")], True, (255, 0, 0), 3)
 fig, ax = plt.subplots(1, 2, figsize=(14, 4))
 ax[0].imshow(vis)
-ax[0].set_title("Trapezio")
-ax[1].imshow(img_roi)
-ax[1].set_title("Dopo la ROI")
+ax[0].set_title("ROI")
+ax[1].imshow(img_grad)
+ax[1].set_title("Dopo la BEW")
 for a in ax:
     a.axis("off")
 plt.show()
