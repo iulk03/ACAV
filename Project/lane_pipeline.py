@@ -1,5 +1,6 @@
 import numpy as np
 import cv2 
+import matplotlib.pyplot as plt
 
 X_RANGE = (-3.0, 3.0)              # metri di strada: (sinistra, destra) rispetto all'auto
 Z_RANGE = (7.0, 30.0)              # metri in avanti: (vicino, lontano). Sotto i ~7 m il                                   # bordo basso dell'immagine non vede piu' la strada
@@ -79,3 +80,27 @@ def treshold(img, k=SOGLIA_K):
     std = np.std(img)
     treshold = mean + k * std
     return (img > treshold).astype(np.uint8) * 255
+
+def lane_pipeline(path, img):
+    calib = leggi_calib(path)
+    trapezio = calcola_trapezio(calib)
+    img_roi = applica_roi(img, trapezio)
+    img_bird_eye, M, M_inv = brid_eye_view(img_roi, trapezio)
+    img_filtered = gaussian_filter(img_bird_eye)
+    img_grad = gradient_filter(img_filtered)
+    img_thresh = treshold(img_grad)
+
+    vis = img.copy()
+    cv2.polylines(vis, [trapezio.astype("int32")], True, (255, 0, 0), 3)
+    fig, ax = plt.subplots(2, 3, figsize=(18, 8))
+    ax = ax.ravel()
+    ax[0].imshow(vis);                        ax[0].set_title("ROI")
+    ax[1].imshow(img_bird_eye);               ax[1].set_title("Bird-eye")
+    ax[2].imshow(img_filtered);  ax[2].set_title("Gaussiano")
+    ax[3].imshow(img_grad);      ax[3].set_title("Gradiente")
+    ax[4].imshow(img_thresh);    ax[4].set_title("Soglia")
+    for a in ax:
+        a.axis("off")
+    plt.show()
+    
+    return M_inv, img_thresh
