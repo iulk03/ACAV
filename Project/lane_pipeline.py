@@ -29,15 +29,17 @@ def calcola_trapezio(calib, x_range=X_RANGE, z_range=Z_RANGE):
     Restituisce i 4 vertici (u, v) in pixel: basso-sx, basso-dx, alto-dx, alto-sx.
     """
     P2 = calib["P2"].reshape(3, 4)                 # proiezione camera 2 (f, cx, cy, ...)
-    T = calib["Tr_cam_to_road"].reshape(3, 4)      # camera -> strada: [R | t]
-    R, t = T[:, :3], T[:, 3]
+    R0_rect = calib["R0_rect"].reshape(3, 3)       # camera non rettificata -> camera rettificata
+    T = calib["Tr_cam_to_road"].reshape(3, 4)      # trasformazione camera -> strada: [R | t]
+    R, t = T[:, :3], T[:, 3] #rotazione e traslazione
  
     def proietta(x, z):
         """Punto SULLA STRADA (x di lato, z in avanti, quota 0) -> pixel (u, v)."""
-        p_strada = np.array([x, 0.0, z])           # z_world = 0, come negli appunti
-        p_cam = R.T @ (p_strada - t)               # dal sistema strada al sistema camera
-        u, v, w = P2 @ np.append(p_cam, 1.0)       # s * (u, v, 1) = P2 * (punto, 1)
-        return [u / w, v / w]                      # dividere per w elimina il fattore s
+        p_strada = np.array([x, 0.0, z])           # punto sulla strada che ha una posizione laterale x e distanza z
+        p_cam = R.T @ (p_strada - t)               # esprime il punto nel sistema camera
+        p_cam_rect = R0_rect @ p_cam                # P2 richiede coordinate della camera rettificata
+        u, v, w = P2 @ np.append(p_cam_rect, 1.0)   # s * (u, v, 1) = P2 * (punto, 1) sono le coordinate del punto proiettato nell'immagine
+        return [u / w, v / w]                      # ottengo posizione in pixel
  
     return np.float32([
         proietta(x_range[0], z_range[0]),          # vicino, sinistra  (in basso)
@@ -64,17 +66,17 @@ def brid_eye_view(img, trapezio, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_P
     return bew, M, M_inv
 
 #segmentation 
-def gaussian_filter(img, ksize=GAUSS_KSIZE):
+def gaussian_filter(img, ksize=GAUSS_KSIZE): #riduce rumore
     grey = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     return cv2.GaussianBlur(grey, (ksize, ksize), 0)
 
-def gradient_filter(img):
+def gradient_filter(img): #cerca cambiamanti di intensità
     """Calcola il gradiente orizzontale e verticale, e restituisce la magnitudine."""
     gx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)  # gradiente orizzontale
     gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)  # gradiente verticale
     return np.sqrt(gx**2 + gy**2)               # magnitudine del gradiente
 
-def treshold(img, k=SOGLIA_K):
+def treshold(img, k=SOGLIA_K): #crea immagine binaria
     """Soglia: media + k * deviazione standard."""
     mean = np.mean(img)
     std = np.std(img)
