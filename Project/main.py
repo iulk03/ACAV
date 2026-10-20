@@ -9,10 +9,11 @@ BASE_DIR = Path(__file__).resolve().parent
 ROOT = BASE_DIR / "data_road"
 um = sorted(glob.glob(f"{ROOT}/training/image_2/um_*.png"))
 umm = sorted(glob.glob(f"{ROOT}/training/image_2/umm_*.png"))
+uu = sorted(glob.glob(f"{ROOT}/training/image_2/uu_*.png"))
 
-IMAGE_INDEX = 10 
+IMAGE_INDEX = 8
 image_path = Path(um[IMAGE_INDEX])
-img = cv2.imread(str(image_path))
+img = cv2.imread(str(image_path))   
 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 calib_path = ROOT / "training" / "calib" / f"{image_path.stem}.txt"

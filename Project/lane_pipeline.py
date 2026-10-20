@@ -2,11 +2,13 @@ import numpy as np
 import cv2 
 import matplotlib.pyplot as plt
 
-X_RANGE = (-3.0, 3.0)              # larghezza della strada in metri
+X_RANGE = (-7.0, 7.0)              # larghezza della strada in metri
 Z_RANGE = (7.0, 20.0)              # profondità della strada in metri                                  s
 PX_PER_M = 30                      # risoluzione della bird-eye view (1 px = 1/30 m)
 GAUSS_KSIZE = 5                    # coefficiente del filtro gaussiano, per ridurre il rumore
-K_TRESHOLD = 3.0                   # coefficiente per la soglia trasformazione binaria: media + k * deviazione standard
+K_TRESHOLD = 3.0
+PERCENTILE = 97.0    # tengo il 3% dei pixel con gradiente più forte
+MIN_GRAD = 0.0       # soglia minima assoluta (da tarare, vedi sotto)                   # coefficiente per la soglia trasformazione binaria: media + k * deviazione standard
 
 #legge da file calibrazione
 def read_calib(path):
@@ -63,6 +65,7 @@ def brid_eye_view(img, trapezoid, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_
 
 def gaussian_filter(img, ksize=GAUSS_KSIZE): 
     grey = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    #grey = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(grey)
     return cv2.GaussianBlur(grey, (ksize, ksize), 0)
 
 def gradient_filter(img): 
@@ -70,10 +73,11 @@ def gradient_filter(img):
     gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3) 
     return np.sqrt(gx**2 + gy**2)               
 
-def treshold(img, k=K_TRESHOLD): 
-    mean = np.mean(img)
+def treshold(img, percentile=PERCENTILE, min_grad=MIN_GRAD): 
+    """mean = np.mean(img)
     std = np.std(img)
-    treshold = mean + k * std
+    treshold = mean + k * std"""
+    treshold = max(np.percentile(img, percentile), min_grad)
     return (img > treshold).astype(np.uint8) * 255
 
 def lane_pipeline(path, img):
@@ -97,5 +101,6 @@ def lane_pipeline(path, img):
     for a in ax:
         a.axis("off")
     plt.show()
+    print("soglia percentile:", np.percentile(img_grad, PERCENTILE))
     
     return M_inv, img_thresh
