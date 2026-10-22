@@ -7,7 +7,7 @@ Z_RANGE = (7.0, 20.0)              # profondità della strada in metri          
 PX_PER_M = 30                      # risoluzione della bird-eye view (1 px = 1/30 m)
 GAUSS_KSIZE = 5                    # coefficiente del filtro gaussiano, per ridurre il rumore
 K_TRESHOLD = 3.0
-PERCENTILE = 97.0    # tengo il 3% dei pixel con gradiente più forte
+PERCENTILE = 97    # tengo il 3% dei pixel con gradiente più forte
 MIN_GRAD = 0.0       # soglia minima assoluta (da tarare, vedi sotto)                   # coefficiente per la soglia trasformazione binaria: media + k * deviazione standard
 
 #legge da file calibrazione
@@ -65,7 +65,6 @@ def brid_eye_view(img, trapezoid, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_
 
 def gaussian_filter(img, ksize=GAUSS_KSIZE): 
     grey = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    #grey = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(grey)
     return cv2.GaussianBlur(grey, (ksize, ksize), 0)
 
 def gradient_filter(img): 
@@ -73,12 +72,13 @@ def gradient_filter(img):
     gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3) 
     return np.sqrt(gx**2 + gy**2)               
 
-def treshold(img, percentile=PERCENTILE, min_grad=MIN_GRAD): 
-    """mean = np.mean(img)
-    std = np.std(img)
-    treshold = mean + k * std"""
-    treshold = max(np.percentile(img, percentile), min_grad)
-    return (img > treshold).astype(np.uint8) * 255
+def treshold(img, percentile=PERCENTILE, min_grad=MIN_GRAD, block=60): 
+    out = np.zeros(img.shape, np.uint8)
+    for c in range(0, img.shape[1], block):
+        blk = img[:, c:c + block]
+        thr = max(np.percentile(blk, percentile), min_grad)
+        out[:, c:c + block] = (blk > thr).astype(np.uint8) * 255
+    return out
 
 def lane_pipeline(path, img):
     calib = read_calib(path)
@@ -88,7 +88,12 @@ def lane_pipeline(path, img):
     img_filtered = gaussian_filter(img_bird_eye)
     img_grad = gradient_filter(img_filtered)
     img_thresh = treshold(img_grad)
+    print_images(img, img_bird_eye, img_filtered, img_grad, img_thresh, trapezoid)
+    #print("soglia percentile:", np.percentile(img_grad, PERCENTILE))
+    
+    return M_inv, img_thresh
 
+def print_images(img,img_bird_eye, img_filtered, img_grad, img_thresh, trapezoid):
     vis = img.copy()
     cv2.polylines(vis, [trapezoid.astype("int32")], True, (255, 0, 0), 3)
     fig, ax = plt.subplots(2, 3, figsize=(18, 8))
@@ -101,6 +106,3 @@ def lane_pipeline(path, img):
     for a in ax:
         a.axis("off")
     plt.show()
-    print("soglia percentile:", np.percentile(img_grad, PERCENTILE))
-    
-    return M_inv, img_thresh

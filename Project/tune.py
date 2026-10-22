@@ -28,7 +28,7 @@ def iou_one(path, p):
     calib = ROOT / "calib" / f"{Path(path).stem}.txt"
     M_inv, th, grey, trap = lp.lane_pipeline(calib, img, show=False,
                                              clip=p["clip"], percentile=p["perc"])
-    for k in ("W_CENTER", "SLOPE_DELTA_MAX", "N_CANDIDATES","EGO_TOL"):
+    for k in ("W_CENTER", "SLOPE_DELTA_MAX", "N_CANDIDATES"):
         setattr(lf, k, p[k])
     out = lf.lane_fitting(th, img, M_inv)
     pred = pred_mask(out, M_inv, img.shape[:2])
@@ -48,9 +48,7 @@ def sample():
                 perc=random.choice([97, 98, 98.5, 99]),
                 W_CENTER=random.choice([10, 20, 40, 100]),
                 SLOPE_DELTA_MAX=random.choice([0.06, 0.1, 0.15]),
-                N_CANDIDATES=random.choice([5, 8]),
-                EGO_TOL=random.choice([0.3, 0.8, 1.5, 3.0, 100.0]))
-
+                N_CANDIDATES=random.choice([5, 8]))
 random.seed(0)
 best, best_s = None, -1
 for t in range(60):

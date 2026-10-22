@@ -17,7 +17,7 @@ N_CANDIDATES = 5            # quante rette candidate cercare (ogni linea bianca 
 Z_REF = 0.5 * (Z_RANGE[0] + Z_RANGE[1])   # z a cui si misura la posizione laterale (dentro il range)
 LANE_W_MIN = 2.5            # larghezza minima plausibile della corsia (m)
 LANE_W_MAX = 4.5            # larghezza massima plausibile (m)
-SLOPE_DELTA_MAX = 0.2       # differenza massima di pendenza tra le due rette
+SLOPE_DELTA_MAX = 0.1       # differenza massima di pendenza tra le due rette
 W_CENTER = 100.0            # peso della penalita' "auto lontana dal centro della coppia" (in pixel/metro)
 LANE_WIDTH_M = 3.2          # larghezza di default per il ripiego (un solo lato trovato)
 

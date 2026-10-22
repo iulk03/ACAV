@@ -11,8 +11,8 @@ um = sorted(glob.glob(f"{ROOT}/training/image_2/um_*.png"))
 umm = sorted(glob.glob(f"{ROOT}/training/image_2/umm_*.png"))
 uu = sorted(glob.glob(f"{ROOT}/training/image_2/uu_*.png"))
 
-IMAGE_INDEX = 8
-image_path = Path(um[IMAGE_INDEX])
+IMAGE_INDEX = 93
+image_path = Path(uu[IMAGE_INDEX])
 img = cv2.imread(str(image_path))   
 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
