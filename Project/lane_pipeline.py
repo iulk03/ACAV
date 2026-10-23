@@ -6,7 +6,7 @@ X_RANGE = (-7.0, 7.0)              # larghezza della strada in metri
 Z_RANGE = (7.0, 20.0)              # profondità della strada in metri                                  s
 PX_PER_M = 30                      # risoluzione della bird-eye view (1 px = 1/30 m)
 GAUSS_KSIZE = 5                    # coefficiente del filtro gaussiano, per ridurre il rumore
-K_TRESHOLD = 3.0
+K_threshold = 3.0
 PERCENTILE = 97    # tengo il 3% dei pixel con gradiente più forte
 MIN_GRAD = 0.0       # soglia minima assoluta (da tarare, vedi sotto)                   # coefficiente per la soglia trasformazione binaria: media + k * deviazione standard
 
@@ -30,14 +30,14 @@ def compute_trapezoid(calib, x_range=X_RANGE, z_range=Z_RANGE):
     R0_rect = calib["R0_rect"].reshape(3, 3)       # camera non rettificata -> camera rettificata
     T = calib["Tr_cam_to_road"].reshape(3, 4)      # trasformazione camera -> strada: [R | t]
     R, t = T[:, :3], T[:, 3] #rotazione e traslazione
- 
+
     def show(x, z):
         p_road = np.array([x, 0.0, z])           
         p_cam = R.T @ (p_road - t)               # esprime il punto nel sistema camera
         p_cam_rect = R0_rect @ p_cam                # coordinate della camera rettificata
         u, v, w = P2 @ np.append(p_cam_rect, 1.0)   # sono le coordinate del punto proiettato nell'immagine
         return [u / w, v / w]                      # ottengo posizione in pixel
- 
+
     return np.float32([
         show(x_range[0], z_range[0]),          
         show(x_range[1], z_range[0]),          
@@ -72,7 +72,7 @@ def gradient_filter(img):
     gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3) 
     return np.sqrt(gx**2 + gy**2)               
 
-def treshold(img, percentile=PERCENTILE, min_grad=MIN_GRAD, block=60): 
+def threshold(img, percentile=PERCENTILE, min_grad=MIN_GRAD, block=60): 
     out = np.zeros(img.shape, np.uint8)
     for c in range(0, img.shape[1], block):
         blk = img[:, c:c + block]
@@ -80,20 +80,22 @@ def treshold(img, percentile=PERCENTILE, min_grad=MIN_GRAD, block=60):
         out[:, c:c + block] = (blk > thr).astype(np.uint8) * 255
     return out
 
-def lane_pipeline(path, img):
+def lane_pipeline(path, img, out_path):
     calib = read_calib(path)
     trapezoid = compute_trapezoid(calib)
     img_roi = apply_roi(img, trapezoid)
     img_bird_eye, M, M_inv = brid_eye_view(img_roi, trapezoid)
     img_filtered = gaussian_filter(img_bird_eye)
-    img_grad = gradient_filter(img_filtered)
-    img_thresh = treshold(img_grad)
-    print_images(img, img_bird_eye, img_filtered, img_grad, img_thresh, trapezoid)
+    img_norm = normalise(img_filtered)
+    valid = valid_bev_mask(img.shape, trapezoid)
+    img_grad = gradient_filter(img_filtered) * valid
+    img_thresh = threshold(img_grad)
+    print_images(img, img_bird_eye, img_filtered, img_grad, img_thresh, trapezoid, out_path)
     #print("soglia percentile:", np.percentile(img_grad, PERCENTILE))
     
-    return M_inv, img_thresh
+    return M_inv, img_thresh, img_filtered
 
-def print_images(img,img_bird_eye, img_filtered, img_grad, img_thresh, trapezoid):
+def print_images(img,img_bird_eye, img_filtered, img_grad, img_thresh, trapezoid, out_path):
     vis = img.copy()
     cv2.polylines(vis, [trapezoid.astype("int32")], True, (255, 0, 0), 3)
     fig, ax = plt.subplots(2, 3, figsize=(18, 8))
@@ -105,4 +107,24 @@ def print_images(img,img_bird_eye, img_filtered, img_grad, img_thresh, trapezoid
     ax[4].imshow(img_thresh);    ax[4].set_title("Soglia")
     for a in ax:
         a.axis("off")
-    plt.show()
+    #plt.show()
+    # save the image in the folder debug_images
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
+
+
+def normalise(img):
+    f = img.astype(np.float32) + 1.0          # +1 avoids division by zero
+    bg = cv2.GaussianBlur(f, (0, 0), 15)      # sigma 15 px, about 0.5 m at 30 px/m
+    r = f / bg                                # ~1 where the brightness is local average
+    return cv2.normalize(r, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+
+
+# debug function: print all candidates on both BEV and line reconstruction on black background
+def valid_bev_mask(img_shape, trapezoid, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
+    ones = np.full(img_shape[:2], 255, np.uint8)
+    roi = apply_roi(ones, trapezoid)
+    bev, _, _ = brid_eye_view(roi, trapezoid, x_range, z_range, px_per_m)
+    return cv2.erode((bev > 0).astype(np.uint8), np.ones((9, 9), np.uint8))
