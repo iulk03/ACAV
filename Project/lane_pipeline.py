@@ -1,39 +1,22 @@
-import numpy as np
-import cv2 
+import cv2
 import matplotlib.pyplot as plt
+import numpy as np
 
-X_RANGE = (-7.0, 7.0)              # larghezza della strada in metri
-Z_RANGE = (7.0, 20.0)              # profondità della strada in metri                                  s
-PX_PER_M = 30                      # risoluzione della bird-eye view (1 px = 1/30 m)
-GAUSS_KSIZE = 5                    # coefficiente del filtro gaussiano, per ridurre il rumore
-K_threshold = 3.0
-PERCENTILE = 97    # tengo il 3% dei pixel con gradiente più forte
-MIN_GRAD = 0.0       # soglia minima assoluta (da tarare, vedi sotto)                   # coefficiente per la soglia trasformazione binaria: media + k * deviazione standard
+import road_classifier as rc
 
-ROAD_THR = 3.0          # distanza di Mahalanobis massima dal colore dell'asfalto (da tarare)
-ROAD_ERODE_PX = 15      # ~0.5 m: tiene lontani i punti RANSAC dal bordo strada
-MIN_ROAD_FRAC = 0.10    # se la maschera copre meno, la considero fallita
+X_RANGE = (-7.0, 7.0)       # road width in metres
+Z_RANGE = (7.0, 20.0)       # road depth in metres
+PX_PER_M = 30               # bird-eye view resolution (1 px = 1/30 m)
+GAUSS_KSIZE = 5             # gaussian kernel size (noise reduction)
+PERCENTILE = 97             # keep the strongest 3% gradient pixels (per block)
+MIN_GRAD = 0.0              # absolute minimum gradient threshold
+BLOCK_PX = 60               # column block used for the local percentile
+MIN_BLOCK_PIXELS = 100      # below this many region pixels in a block, use the global threshold
+ROAD_ERODE_PX = 15          # ~0.5 m: keeps painted-line candidates away from the road border
+MIN_ROAD_FRAC = 0.10        # if the road mask covers less than this, consider it failed
 
-def road_mask(img_rgb, seed_rows=(0.90, 1.0), seed_cols=(0.40, 0.60), thr=ROAD_THR):
-    H, W = img_rgb.shape[:2]
-    ab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)[..., 1:]
-    r0, r1 = int(seed_rows[0] * H), int(seed_rows[1] * H)
-    c0, c1 = int(seed_cols[0] * W), int(seed_cols[1] * W)
-    seed = ab[r0:r1, c0:c1].reshape(-1, 2)
-    mu = seed.mean(0)
-    inv = np.linalg.inv(np.cov(seed.T) + np.eye(2))
-    d = ab - mu
-    dist = np.sqrt(np.einsum("...i,ij,...j->...", d, inv, d))
-    mask = (dist < thr).astype(np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-    _, cc = cv2.connectedComponents(mask)
-    ids = cc[r0:r1, c0:c1]
-    ids = ids[ids > 0]
-    if ids.size == 0:
-        return mask.astype(bool)
-    return cc == np.bincount(ids).argmax()      # componente dominante nel seed
 
-#legge da file calibrazione
+# ---------------- calibration and geometry ----------------
 def read_calib(path):
     calib = {}
     with open(path) as f:
@@ -43,117 +26,140 @@ def read_calib(path):
                 calib[name.strip()] = np.array(values.split(), dtype=float)
     return calib
 
-"""
-    Nei file di KITTI Road ci sono i dati della camera (P2) e la sua posizione
-    rispetto alla strada (Tr_cam_to_road), cioe' le informazioni su campo visivo,
-    posizione e orientazione.
-"""
-def compute_trapezoid(calib, x_range=X_RANGE, z_range=Z_RANGE):
-    P2 = calib["P2"].reshape(3, 4)                 # proiezione camera 2 (f, cx, cy, ...)
-    R0_rect = calib["R0_rect"].reshape(3, 3)       # camera non rettificata -> camera rettificata
-    T = calib["Tr_cam_to_road"].reshape(3, 4)      # trasformazione camera -> strada: [R | t]
-    R, t = T[:, :3], T[:, 3] #rotazione e traslazione
 
-    def show(x, z):
-        p_road = np.array([x, 0.0, z])           
-        p_cam = R.T @ (p_road - t)               # esprime il punto nel sistema camera
-        p_cam_rect = R0_rect @ p_cam                # coordinate della camera rettificata
-        u, v, w = P2 @ np.append(p_cam_rect, 1.0)   # sono le coordinate del punto proiettato nell'immagine
-        return [u / w, v / w]                      # ottengo posizione in pixel
+def compute_trapezoid(calib, x_range=X_RANGE, z_range=Z_RANGE):
+    """Project the road rectangle (x, z) onto the image: returns the 4 trapezoid corners in pixels."""
+    P2 = calib["P2"].reshape(3, 4)
+    R0_rect = calib["R0_rect"].reshape(3, 3)
+    T = calib["Tr_cam_to_road"].reshape(3, 4)
+    R, t = T[:, :3], T[:, 3]
+
+    def project(x, z):
+        p_road = np.array([x, 0.0, z])
+        p_cam = R.T @ (p_road - t)
+        p_cam_rect = R0_rect @ p_cam
+        u, v, w = P2 @ np.append(p_cam_rect, 1.0)
+        return [u / w, v / w]
 
     return np.float32([
-        show(x_range[0], z_range[0]),          
-        show(x_range[1], z_range[0]),          
-        show(x_range[1], z_range[1]),          
-        show(x_range[0], z_range[1]),          
+        project(x_range[0], z_range[0]),
+        project(x_range[1], z_range[0]),
+        project(x_range[1], z_range[1]),
+        project(x_range[0], z_range[1]),
     ])
 
-#Scarta tutto cio' che sta fuori dal trapezio.
+
 def apply_roi(img, trapezoid):
     mask = np.zeros(img.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(mask, [trapezoid.astype(np.int32)], 255)   
-    return cv2.bitwise_and(img, img, mask=mask)            
+    cv2.fillPoly(mask, [trapezoid.astype(np.int32)], 255)
+    return cv2.bitwise_and(img, img, mask=mask)
 
+
+# NOTE: the name "brid_eye_view" is kept on purpose: road_classifier.py calls lp.brid_eye_view
 def brid_eye_view(img, trapezoid, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
-    # dimensioni della bird-eye view in pixel
     width = int((x_range[1] - x_range[0]) * px_per_m)
     height = int((z_range[1] - z_range[0]) * px_per_m)
-    trapezoid_dst = np.float32([[0, height], [width, height], [width, 0], [0, 0]])  
-    M = cv2.getPerspectiveTransform(trapezoid, trapezoid_dst)      # matrice di trasformazione
-    M_inv = cv2.getPerspectiveTransform(trapezoid_dst, trapezoid)  # matrice inversa
-    bew =  cv2.warpPerspective(img, M, (width, height)) 
-    return bew, M, M_inv
+    trapezoid_dst = np.float32([[0, height], [width, height], [width, 0], [0, 0]])
+    M = cv2.getPerspectiveTransform(trapezoid, trapezoid_dst)
+    M_inv = cv2.getPerspectiveTransform(trapezoid_dst, trapezoid)
+    bev = cv2.warpPerspective(img, M, (width, height))
+    return bev, M, M_inv
 
-#image segmentation 
 
-def gaussian_filter(img, ksize=GAUSS_KSIZE): 
+# ---------------- gradient segmentation (painted lines) ----------------
+def gaussian_filter(img, ksize=GAUSS_KSIZE):
     grey = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     return cv2.GaussianBlur(grey, (ksize, ksize), 0)
 
-def gradient_filter(img): 
-    gx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)  
-    gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3) 
-    return np.sqrt(gx**2 + gy**2)               
 
-def threshold(img, percentile=PERCENTILE, min_grad=MIN_GRAD, block=60): 
-    out = np.zeros(img.shape, np.uint8)
-    for c in range(0, img.shape[1], block):
-        blk = img[:, c:c + block]
-        thr = max(np.percentile(blk, percentile), min_grad)
-        out[:, c:c + block] = (blk > thr).astype(np.uint8) * 255
+def gradient_filter(img):
+    gx = cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=3)
+    return np.sqrt(gx ** 2 + gy ** 2)
+
+
+def threshold(grad, region, percentile=PERCENTILE, min_grad=MIN_GRAD, block=BLOCK_PX):
+    """
+    Per-block percentile threshold computed ONLY on the pixels inside `region`
+    (so grass/hedge texture does not raise the threshold and hide the painted lines).
+    """
+    out = np.zeros(grad.shape, np.uint8)
+    if not region.any():
+        return out
+    global_thr = max(np.percentile(grad[region], percentile), min_grad)
+    for c in range(0, grad.shape[1], block):
+        ok = region[:, c:c + block]
+        blk = grad[:, c:c + block]
+        if ok.sum() >= MIN_BLOCK_PIXELS:
+            thr = max(np.percentile(blk[ok], percentile), min_grad)
+        else:
+            thr = global_thr
+        out[:, c:c + block] = ((blk > thr) & ok).astype(np.uint8) * 255
     return out
 
-def lane_pipeline(path, img, out_path):
-    calib = read_calib(path)
+
+# ---------------- main pipeline ----------------
+def lane_pipeline(calib_path, img, out_path=None):
+    calib = read_calib(calib_path)
     trapezoid = compute_trapezoid(calib)
-    img_roi = apply_roi(img, trapezoid)
-    img_bird_eye, M, M_inv = brid_eye_view(img_roi, trapezoid)
-    img_filtered = gaussian_filter(img_bird_eye)
-    valid = valid_bev_mask(img.shape, trapezoid).astype(bool)
-    img_grad = gradient_filter(img_filtered) * valid
-    img_thresh = threshold(img_grad)
+    bev, M, M_inv = brid_eye_view(apply_roi(img, trapezoid), trapezoid)
+    h, w = bev.shape[:2]
 
-    # maschera strada calcolata sull'immagine intera, poi portata in BEV con la stessa M
-    h, w = img_thresh.shape
-    road = road_mask(img)
-    road_bev = cv2.warpPerspective(road.astype(np.uint8) * 255, M, (w, h), flags=cv2.INTER_NEAREST) > 0
-    road_bev &= valid
-    if road_bev.mean() > MIN_ROAD_FRAC:
-        inner = cv2.erode(road_bev.astype(np.uint8), np.ones((ROAD_ERODE_PX, ROAD_ERODE_PX), np.uint8)).astype(bool)
-        img_thresh = img_thresh * inner      # RANSAC non vede più erba e siepe
+    # BEV pixels that really come from the image (the trapezoid can stick out of it)
+    valid = cv2.warpPerspective(np.full(img.shape[:2], 255, np.uint8), M, (w, h),
+                                flags=cv2.INTER_NEAREST) > 0
 
-    print_images(img, img_bird_eye, img_filtered, img_grad, img_thresh, road_bev, trapezoid, out_path)
-    return dict(M=M, M_inv=M_inv, thresh=img_thresh, gray=img_filtered, road=road_bev, valid=valid)
+    # 1) gradient branch: painted-line candidates
+    gray = gaussian_filter(bev)
+    grad = gradient_filter(gray) * valid
 
-def print_images(img, img_bird_eye, img_filtered, img_grad, img_thresh, road_bev, trapezoid, out_path):
-    vis = img.copy()
-    cv2.polylines(vis, [trapezoid.astype("int32")], True, (255, 0, 0), 3)
-    fig, ax = plt.subplots(2, 3, figsize=(18, 8))
-    ax = ax.ravel()
-    ax[0].imshow(vis);           ax[0].set_title("ROI")
-    ax[1].imshow(img_bird_eye);  ax[1].set_title("Bird-eye")
-    ax[2].imshow(img_filtered);  ax[2].set_title("Gaussiano")
-    ax[3].imshow(img_grad);      ax[3].set_title("Gradiente")
-    ax[4].imshow(img_thresh);    ax[4].set_title("Soglia (solo su strada)")
-    ax[5].imshow(road_bev);      ax[5].set_title("Maschera strada")
-    for a in ax:
-        a.axis("off")
+    # 2) classifier branch (from swami): road mask, road contour, colour edges
+    road_u8 = rc.road_mask_bev(bev, valid)              # uint8 0/255
+    road_ok = (road_u8 > 0).mean() > MIN_ROAD_FRAC
+    if road_ok:
+        road = road_u8 > 0
+        # painted lines are searched only well inside the road
+        region = cv2.erode(road.astype(np.uint8), np.ones((ROAD_ERODE_PX, ROAD_ERODE_PX), np.uint8)) > 0
+        road_edge = rc.road_edge(road_u8, valid)        # road contour, used as separate edge candidates
+    else:
+        road_u8 = np.zeros_like(road_u8)                # failed mask: no road-edge candidates either
+        road = np.zeros(road_u8.shape, dtype=bool)
+        region = cv2.erode(valid.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        road_edge = np.zeros_like(road_u8)
+
+    grad_thr = threshold(grad, region)
+    chroma = rc.chroma_edges(bev, valid)                # colour edges: asphalt/grass, painted lines
+    thresh = cv2.bitwise_or(grad_thr, chroma)           # what RANSAC sees (road edge stays separate)
+
+    if out_path is not None:
+        vis = img.copy()
+        cv2.polylines(vis, [trapezoid.astype("int32")], True, (255, 0, 0), 3)
+        save_panels([
+            ("ROI", vis, None),
+            ("Bird-eye", bev, None),
+            ("Gaussian", gray, "gray"),
+            ("Gradient", grad, "gray"),
+            ("Gradient threshold (road only)", grad_thr, "gray"),
+            ("Road mask", road_u8, "gray"),
+            ("Road edge", road_edge, "gray"),
+            ("Colour edges", chroma, "gray"),
+            ("Final threshold", thresh, "gray"),
+        ], out_path)
+
+    return dict(M=M, M_inv=M_inv, thresh=thresh, road_edge=road_edge,
+                road=road, valid=valid, gray=gray, grad=grad)
+
+
+def save_panels(panels, out_path, ncols=3):
+    """Save a grid of (title, image, cmap) panels to out_path."""
+    nrows = int(np.ceil(len(panels) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows))
+    axes = np.atleast_1d(axes).ravel()
+    for ax, (title, data, cmap) in zip(axes, panels):
+        ax.imshow(data, cmap=cmap)
+        ax.set_title(title)
+    for ax in axes:
+        ax.axis("off")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-
-
-def normalise(img):
-    f = img.astype(np.float32) + 1.0          # +1 avoids division by zero
-    bg = cv2.GaussianBlur(f, (0, 0), 15)      # sigma 15 px, about 0.5 m at 30 px/m
-    r = f / bg                                # ~1 where the brightness is local average
-    return cv2.normalize(r, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-
-
-# debug function: print all candidates on both BEV and line reconstruction on black background
-def valid_bev_mask(img_shape, trapezoid, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
-    ones = np.full(img_shape[:2], 255, np.uint8)
-    roi = apply_roi(ones, trapezoid)
-    bev, _, _ = brid_eye_view(roi, trapezoid, x_range, z_range, px_per_m)
-    return cv2.erode((bev > 0).astype(np.uint8), np.ones((9, 9), np.uint8))
