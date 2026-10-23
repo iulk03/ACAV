@@ -1,6 +1,7 @@
 import numpy as np
 import cv2 
 import matplotlib.pyplot as plt
+import road_classifier as rc
 
 X_RANGE = (-7.0, 7.0)              # larghezza della strada in metri
 Z_RANGE = (7.0, 20.0)              # profondità della strada in metri                                  s
@@ -88,19 +89,41 @@ def lane_pipeline(path, img):
     img_filtered = gaussian_filter(img_bird_eye)
     img_grad = gradient_filter(img_filtered)
     img_thresh = treshold(img_grad)
+
+    thr_grad = img_thresh.copy()          
+
+    h, w = img_bird_eye.shape[:2]
+    valid = cv2.warpPerspective(np.full(img.shape[:2], 255, np.uint8), M, (w, h),
+                                flags=cv2.INTER_NEAREST) > 0
+    road_mask = rc.road_mask_bev(img_bird_eye, valid)
+    road_edge = rc.road_edge(road_mask, valid)
+    chroma = rc.chroma_edges(img_bird_eye, valid)
+    img_thresh = cv2.bitwise_or(img_thresh, cv2.bitwise_or(road_edge, chroma))
+    #img_thresh = cv2.bitwise_or(img_thresh, road_edge)
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+    ax[0].imshow(img_bird_eye); ax[0].set_title("BEV")
+    ax[1].imshow(road_mask);    ax[1].set_title("Maschera strada")
+    ax[2].imshow(thr_grad);     ax[2].set_title("Solo gradiente")
+    plt.show()
+    # ---------------------------
+
+    print_images(img, img_bird_eye, chroma, img_grad, img_thresh, trapezoid)
+    return M_inv, img_thresh
     print_images(img, img_bird_eye, img_filtered, img_grad, img_thresh, trapezoid)
     #print("soglia percentile:", np.percentile(img_grad, PERCENTILE))
     
     return M_inv, img_thresh
 
-def print_images(img,img_bird_eye, img_filtered, img_grad, img_thresh, trapezoid):
+def print_images(img,img_bird_eye, chroma, img_grad, img_thresh, trapezoid):
     vis = img.copy()
     cv2.polylines(vis, [trapezoid.astype("int32")], True, (255, 0, 0), 3)
     fig, ax = plt.subplots(2, 3, figsize=(18, 8))
     ax = ax.ravel()
     ax[0].imshow(vis);                        ax[0].set_title("ROI")
     ax[1].imshow(img_bird_eye);               ax[1].set_title("Bird-eye")
-    ax[2].imshow(img_filtered);  ax[2].set_title("Gaussiano")
+    #ax[2].imshow(img_filtered);  ax[2].set_title("Gaussiano")
+    ax[2].imshow(chroma); ax[2].set_title("Bordi di colore")
     ax[3].imshow(img_grad);      ax[3].set_title("Gradiente")
     ax[4].imshow(img_thresh);    ax[4].set_title("Soglia")
     for a in ax:
