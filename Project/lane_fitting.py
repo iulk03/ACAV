@@ -12,16 +12,47 @@ SUCCESS_PROBABILITY = 0.99
 MAX_ITER = 500
 MIN_INLIERS = 100
 MAX_SLOPE = 0.5             # max slope of a single line (x = a*z + b)
+SNAP_MIN_SCORE = 0.3        # fraction of the line length that must look like a road boundary
+SNAP_OFFSET_M = 0.3
 
 # ---------------- candidate and lane parameters ----------------
 N_CANDIDATES = 10           # how many candidate lines to search for
 SLOPE_DELTA_MAX = 0.5       # max slope difference to be considered parallel
 MERGE_DIST_M = 1.0          # lines closer than this (in x) are merged
-ROAD_EDGE_THRESHOLD_M = 0.15
+ROAD_EDGE_THRESHOLD_M = 0.25
 ROAD_EDGE_MIN_INLIERS = 40
 MIN_SUPPORT_FRAC = 0.2   # painted lines with fewer inliers than 20% of the best one are dropped
+MERGE_DIST_M = 1.0          # painted line vs road edge
+MIN_LANE_WIDTH_M = 2.0      # painted line vs painted line
 
 CAND_COLORS = ["red", "cyan", "lime", "magenta", "orange", "dodgerblue", "gold", "deeppink", "white", "mediumpurple"]
+
+
+def boundary_score(c, road, side):
+    """Fraction of the line where the inner side is road and the outer side is not."""
+    h, w = road.shape
+    z = np.linspace(Z_RANGE[0] + 0.5, Z_RANGE[1] - 0.5, 60)
+    x = c["a"] * z + c["b"]
+    rows = ((Z_RANGE[1] - z) * PX_PER_M).astype(int)
+    c_in = ((x - side * SNAP_OFFSET_M - X_RANGE[0]) * PX_PER_M).astype(int)
+    c_out = ((x + side * SNAP_OFFSET_M - X_RANGE[0]) * PX_PER_M).astype(int)
+    ok = (rows >= 0) & (rows < h) & (c_in >= 0) & (c_in < w) & (c_out >= 0) & (c_out < w)
+    if not ok.any():
+        return 0.0
+    hit = road[rows[ok], c_in[ok]] & ~road[rows[ok], c_out[ok]]
+    return float(hit.sum()) / len(z)          # normalised by the full length, not only the visible part
+
+
+def snap_edge(edge, cands, road, side):
+    """Replace the RANSAC road edge with the innermost painted line that behaves like a boundary."""
+    on_side = [c for c in cands if side * x_at(c) > 0]
+    on_side.sort(key=lambda c: side * x_at(c))                 # innermost first
+    for c in on_side:
+        if boundary_score(c, road, side) >= SNAP_MIN_SCORE:
+            if edge is None or side * x_at(c) < side * x_at(edge):
+                return dict(c, edge=True)
+            break
+    return edge
 
 
 def cv2_color(name):
@@ -40,12 +71,26 @@ def points_in_meters(img_thresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_R
     return dict(x=x, z=z)
 
 
-def road_edge_points(edge_img, direction):
-    """Road-contour pixels on one side of the vehicle, in metres."""
-    pts = points_in_meters(edge_img)
-    x, z = pts["x"], pts["z"]
-    side = x < 0 if direction < 0 else x > 0
-    return np.column_stack((x[side], z[side]))
+def road_edge_points(road, safe, direction):
+    """First road -> non-road transition going outward from the vehicle column, per row."""
+    h, w = road.shape
+    c = w // 2
+    xs, zs = [], []
+    for r in range(h):
+        row = road[r]
+        if not row[c]:
+            continue
+        if direction > 0:
+            nz = np.flatnonzero(~row[c:])
+            col = c + nz[0] if len(nz) else None
+        else:
+            nz = np.flatnonzero(~row[:c + 1][::-1])
+            col = c - nz[0] if len(nz) else None
+        if col is None or not safe[r, col]:
+            continue                      # road touches the border / boundary is fake
+        xs.append(X_RANGE[0] + col / PX_PER_M)
+        zs.append(Z_RANGE[1] - r / PX_PER_M)
+    return np.column_stack((xs, zs)) if xs else np.empty((0, 2))
 
 
 # ---------------- RANSAC (one line) ----------------
@@ -136,15 +181,14 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
     return cands
 
 
-def road_edge_candidate(edge_img, direction):
-    """RANSAC line on one side of the road contour. Edge lines have no inlier mask."""
-    p = road_edge_points(edge_img, direction)
+def road_edge_candidate(road, safe, direction):
+    p = road_edge_points(road, safe, direction)
     if len(p) < ROAD_EDGE_MIN_INLIERS:
         return None
     r = ransac(p, threshold=ROAD_EDGE_THRESHOLD_M, min_inliers=ROAD_EDGE_MIN_INLIERS)
     if r is None:
         return None
-    r["inliers"] = None      # edge points are not in the 'pts' array of the gradient
+    r["inliers"] = None
     r["edge"] = True
     return r
 
@@ -171,11 +215,14 @@ def filter_parallel(cands, edges):
 def merge_close(lines):
     out = []
     for c in sorted(lines, key=x_at):
-        if out and x_at(c) - x_at(out[-1]) < MERGE_DIST_M:
-            if _rank(c) > _rank(out[-1]):
-                out[-1] = c
-        else:
-            out.append(c)
+        if out:
+            gap = x_at(c) - x_at(out[-1])
+            both_painted = not c.get("edge") and not out[-1].get("edge")
+            if gap < (MIN_LANE_WIDTH_M if both_painted else MERGE_DIST_M):
+                if _rank(c) > _rank(out[-1]):
+                    out[-1] = c
+                continue
+        out.append(c)
     return out
 
 
@@ -220,8 +267,11 @@ def lane_fitting(pipe, img):
     pts = np.column_stack((pts_dict["x"], pts_dict["z"]))
 
     cands = find_candidates(pts)
-    edge_l = road_edge_candidate(pipe["road_edge"], -1)
-    edge_r = road_edge_candidate(pipe["road_edge"], +1)
+    safe = cv2.erode(pipe["valid"].astype(np.uint8), np.ones((17, 17), np.uint8)) > 0
+    edge_l = road_edge_candidate(pipe["road"], safe, -1)
+    edge_r = road_edge_candidate(pipe["road"], safe, +1)
+    edge_l = snap_edge(edge_l, cands, pipe["road"], -1)
+    edge_r = snap_edge(edge_r, cands, pipe["road"], +1)
     lanes = build_lanes(cands, edge_l, edge_r)
     ego = next((ln for ln in lanes if ln[2]), None)
 

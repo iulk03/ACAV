@@ -20,6 +20,8 @@ BASE_DIR = Path(__file__).resolve().parent
 ROOT = BASE_DIR / "data_road"
 MODEL_PATH = BASE_DIR / "road_clf.joblib"
 
+N_NEAR = 3000        # hard negatives: non-road pixels close to the road (sidewalks, bike lanes)
+NEAR_PX = 30         # ~1 m
 N_RANDOM = 2000      # pixel casuali per immagine
 N_BOUNDARY = 2000    # pixel vicino al bordo strada (e' li' che si decide tutto)
 BAND_PX = 12         # semi-larghezza della banda attorno al bordo, in pixel (BEV: 30 px = 1 m)
@@ -85,14 +87,17 @@ def road_gt(image_path):
     gt = cv2.imread(str(gt_path), cv2.IMREAD_UNCHANGED)
     # OpenCV legge BGR: canale 0 (blu) = strada, canale 2 (rosso) = area valida della GT
     return gt[:, :, 0] > 0, gt[:, :, 2] > 0
-
+    
 
 def sample_pixels(img, road, valid, rng):
-    """Mix di pixel casuali e pixel vicini al bordo strada (dove il classificatore deve essere preciso)."""
     r8 = road.astype(np.uint8)
     k = np.ones((2 * BAND_PX + 1, 2 * BAND_PX + 1), np.uint8)
     band = (cv2.dilate(r8, k) != cv2.erode(r8, k)) & valid
-    pools = [(np.flatnonzero(valid.ravel()), N_RANDOM), (np.flatnonzero(band.ravel()), N_BOUNDARY)]
+    kn = np.ones((2 * NEAR_PX + 1, 2 * NEAR_PX + 1), np.uint8)
+    near = (cv2.dilate(r8, kn) > 0) & ~road & valid
+    pools = [(np.flatnonzero(valid.ravel()), N_RANDOM),
+             (np.flatnonzero(band.ravel()), N_BOUNDARY),
+             (np.flatnonzero(near.ravel()), N_NEAR)]
     idx = np.concatenate([rng.choice(p, min(n, len(p)), replace=False) for p, n in pools if len(p)])
     return pixel_features(img)[idx], road.ravel()[idx]
 

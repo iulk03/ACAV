@@ -9,7 +9,7 @@ ROOT = BASE_DIR / "data_road"
 OUT_DIR = BASE_DIR / "debug_images"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-SINGLE = 1 # set this variable to a number to process one image, None to process all the images
+SINGLE = 3 # set this variable to a number to process one image, None to process all the images
 
 um = sorted(glob.glob(f"{ROOT}/training/image_2/um_*.png"))
 
