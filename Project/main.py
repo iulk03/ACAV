@@ -9,7 +9,7 @@ ROOT = BASE_DIR / "data_road"
 OUT_DIR = BASE_DIR / "debug_images"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-SINGLE = 94 # set this variable to a number to process one image, None to process all the images
+SINGLE = 1 # set this variable to a number to process one image, None to process all the images
 
 um = sorted(glob.glob(f"{ROOT}/training/image_2/um_*.png"))
 
@@ -30,7 +30,7 @@ def execute(img_idx):
                         OUT_DIR / f"{stem}_cands_bev.png", OUT_DIR / f"{stem}_cands_img.png")
 
     if "overlay" in out:
-        cv2.imwrite(str(OUT_DIR / f"00_{stem}_overlay.png"), cv2.cvtColor(out["overlay"], cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(OUT_DIR / f"{stem}_overlay.png"), cv2.cvtColor(out["overlay"], cv2.COLOR_RGB2BGR))
         print(f"img: {img_idx}, lanes: {len(out['lanes'])} (ego found: {out['ransac_sx'] is not None})")
     else:
         print(f"No lane found. Points: {len(out['pts'])}; painted candidates: {len(out['candidates'])}; "f"road edges: {len(out['edges'])}")

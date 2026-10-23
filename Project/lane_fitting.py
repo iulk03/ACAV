@@ -19,6 +19,7 @@ SLOPE_DELTA_MAX = 0.5       # max slope difference to be considered parallel
 MERGE_DIST_M = 1.0          # lines closer than this (in x) are merged
 ROAD_EDGE_THRESHOLD_M = 0.15
 ROAD_EDGE_MIN_INLIERS = 40
+MIN_SUPPORT_FRAC = 0.2   # painted lines with fewer inliers than 20% of the best one are dropped
 
 CAND_COLORS = ["red", "cyan", "lime", "magenta", "orange", "dodgerblue", "gold", "deeppink", "white", "mediumpurple"]
 
@@ -181,12 +182,16 @@ def merge_close(lines):
 def build_lanes(cands, left_edge, right_edge):
     edges = [e for e in (left_edge, right_edge) if e]
     painted = filter_parallel(cands, edges)
+    if painted:
+        best = max(int(c["inliers"].sum()) for c in painted)
+        painted = [c for c in painted if c["inliers"].sum() >= MIN_SUPPORT_FRAC * best]
     if left_edge:
         painted = [c for c in painted if x_at(c) > x_at(left_edge) + MERGE_DIST_M]
     if right_edge:
         painted = [c for c in painted if x_at(c) < x_at(right_edge) - MERGE_DIST_M]
     lines = merge_close(painted + edges)
-    return [[l, r, x_at(l) < 0 < x_at(r)] for l, r in zip(lines[:-1], lines[1:])]
+    z_ego = Z_RANGE[0]
+    return [[l, r, x_at(l, z_ego) < 0 < x_at(r, z_ego)] for l, r in zip(lines[:-1], lines[1:])]
 
 
 # ---------------- drawing ----------------
