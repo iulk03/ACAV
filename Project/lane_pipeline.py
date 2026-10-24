@@ -1,8 +1,10 @@
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+import lane_fitting as lf
 
 import road_classifier as rc
+#import net_classifier as nc
 
 X_RANGE = (-7.0, 7.0)       # road width in metres
 Z_RANGE = (7.0, 20.0)       # road depth in metres
@@ -14,6 +16,10 @@ BLOCK_PX = 60               # column block used for the local percentile
 MIN_BLOCK_PIXELS = 100      # below this many region pixels in a block, use the global threshold
 ROAD_ERODE_PX = 15          # ~0.5 m: keeps painted-line candidates away from the road border
 MIN_ROAD_FRAC = 0.10        # if the road mask covers less than this, consider it failed
+LINE_WIDTH_PX = 13      # ~0.43 m: anything wider than this is not paint
+LINE_MIN_LEN_PX = 21    # ~0.7 m: anything shorter vertically is not a marking
+MIN_WEDGE_M = 2.5       # sanity bounds on the road width
+MAX_WEDGE_M = 12.0
 
 
 # ---------------- calibration and geometry ----------------
@@ -98,6 +104,33 @@ def threshold(grad, region, percentile=PERCENTILE, min_grad=MIN_GRAD, block=BLOC
     return out
 
 
+def line_ridge(gray, valid):
+    """Thin bright vertical structures only: shadow edges are steps, not ridges, so they are suppressed."""
+    k_w = cv2.getStructuringElement(cv2.MORPH_RECT, (LINE_WIDTH_PX, 1))
+    k_l = cv2.getStructuringElement(cv2.MORPH_RECT, (1, LINE_MIN_LEN_PX))
+    ridge = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, k_w)
+    ridge = cv2.morphologyEx(ridge, cv2.MORPH_OPEN, k_l)
+    return ridge * valid
+
+
+def road_wedge(edge_l, edge_r, shape):
+    """Area between two fitted road edges, extrapolated over the whole BEV height."""
+    h, w = shape
+    wedge = np.zeros((h, w), bool)
+    if edge_l is None or edge_r is None:
+        return wedge                     # one edge alone would cover half the image: do nothing
+    z = Z_RANGE[1] - (np.arange(h) + 0.5) / PX_PER_M
+    x_l = edge_l["a"] * z + edge_l["b"]
+    x_r = edge_r["a"] * z + edge_r["b"]
+    width = x_r - x_l
+    if width.min() < MIN_WEDGE_M or width.max() > MAX_WEDGE_M:
+        return wedge                     # implausible geometry: the extrapolation is wrong
+    cols = np.arange(w)[None, :]
+    c_l = ((x_l - X_RANGE[0]) * PX_PER_M)[:, None]
+    c_r = ((x_r - X_RANGE[0]) * PX_PER_M)[:, None]
+    return (cols >= c_l) & (cols <= c_r)
+
+
 # ---------------- main pipeline ----------------
 def lane_pipeline(calib_path, img, out_path=None):
     calib = read_calib(calib_path)
@@ -111,7 +144,8 @@ def lane_pipeline(calib_path, img, out_path=None):
 
     # 1) gradient branch: painted-line candidates
     gray = gaussian_filter(bev)
-    grad = gradient_filter(gray) * valid
+    #grad = gradient_filter(gray) * valid ----------------------------------------------------------------------  HERE
+    grad = line_ridge(gray, valid).astype(np.float64)
 
     # 2) classifier branch (from swami): road mask, road contour, colour edges
     road_u8 = rc.road_mask_bev(bev, valid)              # uint8 0/255
@@ -119,7 +153,11 @@ def lane_pipeline(calib_path, img, out_path=None):
     if road_ok:
         road = road_u8 > 0
         # painted lines are searched only well inside the road
-        region = cv2.erode(road.astype(np.uint8), np.ones((ROAD_ERODE_PX, ROAD_ERODE_PX), np.uint8)) > 0
+        safe = cv2.erode(valid.astype(np.uint8), np.ones((17, 17), np.uint8)) > 0
+        edge_l = lf.road_edge_candidate(road, safe, -1)
+        edge_r = lf.road_edge_candidate(road, safe, +1)
+        wedge = road_wedge(edge_l, edge_r, road.shape)
+        region = cv2.erode((road | wedge).astype(np.uint8), np.ones((ROAD_ERODE_PX, ROAD_ERODE_PX), np.uint8)) > 0
         road_edge = rc.road_edge(road_u8, valid)        # road contour, used as separate edge candidates
     else:
         road_u8 = np.zeros_like(road_u8)                # failed mask: no road-edge candidates either

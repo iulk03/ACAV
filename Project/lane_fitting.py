@@ -6,27 +6,36 @@ from lane_pipeline import X_RANGE, Z_RANGE, PX_PER_M
 
 # ---------------- RANSAC parameters ----------------
 MARGIN_PX = 6               # ignore pixels too close to the image border
-INLINER_TRESHOLD_M = 0.20   # max distance to be an inlier
-MIN_SEPARATION_M = 3.0      # min z distance between the two points defining a line
+INLINER_TRESHOLD_M = 0.2    # max distance to be an inlier
+MIN_SEPARATION_M = 2.0      # min z distance between the two points defining a line
 SUCCESS_PROBABILITY = 0.99
 MAX_ITER = 500
 MIN_INLIERS = 100
-MAX_SLOPE = 0.5             # max slope of a single line (x = a*z + b)
+MAX_SLOPE = 0.25            # max slope of a single line (x = a*z + b)
+SLOPE_TOL = 0.06            # painted lines: |a - a_ref| <= SLOPE_TOL, a_ref from the road edges
+COV_BIN_M = 0.1             # z-bin used to measure how much of the line is actually covered
 SNAP_MIN_SCORE = 0.3        # fraction of the line length that must look like a road boundary
 SNAP_OFFSET_M = 0.3
 
 # ---------------- candidate and lane parameters ----------------
 N_CANDIDATES = 10           # how many candidate lines to search for
 SLOPE_DELTA_MAX = 0.5       # max slope difference to be considered parallel
-MERGE_DIST_M = 1.0          # lines closer than this (in x) are merged
+MERGE_DIST_M = 2.0          # lines closer than this (in x) are merged
 ROAD_EDGE_THRESHOLD_M = 0.25
 ROAD_EDGE_MIN_INLIERS = 40
-MIN_SUPPORT_FRAC = 0.2   # painted lines with fewer inliers than 20% of the best one are dropped
-MERGE_DIST_M = 1.0          # painted line vs road edge
+MIN_SUPPORT_FRAC = 0.2      # painted lines with fewer inliers than 20% of the best one are dropped
 MIN_LANE_WIDTH_M = 2.0      # painted line vs painted line
+ROAD_GAP_M = 3.5            # max non-road gap between the vehicle column and the first road run (shadow holes)
 
 CAND_COLORS = ["red", "cyan", "lime", "magenta", "orange", "dodgerblue", "gold", "deeppink", "white", "mediumpurple"]
+EGO_FILL = (0, 255, 0)      # RGB: ego lane
+OTHER_FILL = (255, 0, 0)    # RGB: every other lane
 
+def cv2_color(name):
+    """Matplotlib colour name -> RGB tuple 0-255 for cv2 (the images are RGB)."""
+    return tuple(int(255 * v) for v in mcolors.to_rgb(name))
+
+LINE_COLORS = [cv2_color("magenta"), cv2_color("yellow"), cv2_color("blue")]
 
 def boundary_score(c, road, side):
     """Fraction of the line where the inner side is road and the outer side is not."""
@@ -55,11 +64,6 @@ def snap_edge(edge, cands, road, side):
     return edge
 
 
-def cv2_color(name):
-    """Matplotlib colour name -> RGB tuple 0-255 for cv2 (the images are RGB)."""
-    return tuple(int(255 * v) for v in mcolors.to_rgb(name))
-
-
 # ---------------- binary image -> road coordinates ----------------
 def points_in_meters(img_thresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_RANGE, margin_px=MARGIN_PX):
     height, width = img_thresh.shape
@@ -71,26 +75,53 @@ def points_in_meters(img_thresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_R
     return dict(x=x, z=z)
 
 
-def road_edge_points(road, safe, direction):
-    """First road -> non-road transition going outward from the vehicle column, per row."""
+def road_edge_points(road, safe, direction, tolerant=False):
+    """
+    strict   : the vehicle column must be road; edge = first road -> non-road transition outward.
+    tolerant : if the vehicle column is not road, use the outer end of the first road run
+               found within ROAD_GAP_M.
+    """
     h, w = road.shape
     c = w // 2
+    max_gap = int(ROAD_GAP_M * PX_PER_M)
     xs, zs = [], []
     for r in range(h):
-        row = road[r]
-        if not row[c]:
-            continue
-        if direction > 0:
-            nz = np.flatnonzero(~row[c:])
-            col = c + nz[0] if len(nz) else None
+        seg = road[r, c:] if direction > 0 else road[r, :c + 1][::-1]
+        if seg[0]:
+            start = 0                              # strict case: vehicle column is road
+        elif tolerant:
+            hits = np.flatnonzero(seg)
+            if len(hits) == 0 or hits[0] > max_gap:
+                continue                           # no road nearby / hole too wide
+            start = hits[0]
         else:
-            nz = np.flatnonzero(~row[:c + 1][::-1])
-            col = c - nz[0] if len(nz) else None
-        if col is None or not safe[r, col]:
-            continue                      # road touches the border / boundary is fake
+            continue
+        end = np.flatnonzero(~seg[start:])
+        if len(end) == 0:
+            continue                               # road touches the border
+        k = start + end[0]                         # first non-road pixel after the run
+        col = c + k if direction > 0 else c - k
+        if not safe[r, col]:
+            continue                               # boundary is fake
         xs.append(X_RANGE[0] + col / PX_PER_M)
         zs.append(Z_RANGE[1] - r / PX_PER_M)
     return np.column_stack((xs, zs)) if xs else np.empty((0, 2))
+
+
+def road_edge_candidate(road, safe, direction):
+    """Try the strict extraction first; fall back to the tolerant one only if it yields no valid line."""
+    for tolerant in (False, True):
+        p = road_edge_points(road, safe, direction, tolerant=tolerant)
+        if len(p) < ROAD_EDGE_MIN_INLIERS:
+            continue
+        r = ransac(p, threshold=ROAD_EDGE_THRESHOLD_M, min_inliers=ROAD_EDGE_MIN_INLIERS)
+        if r is None:
+            continue
+        r["inliers"] = None
+        r["edge"] = True
+        r["tolerant"] = tolerant           # for debugging
+        return r
+    return None
 
 
 # ---------------- RANSAC (one line) ----------------
@@ -107,47 +138,52 @@ def line_distance(points, a, b):
     return np.abs(points[:, 0] - (a * points[:, 1] + b)) / np.sqrt(a ** 2 + 1)
 
 
-def line_fit(p1, p2, separation=MIN_SEPARATION_M, max_slope=MAX_SLOPE):
+def line_fit(p1, p2, separation=MIN_SEPARATION_M, max_slope=MAX_SLOPE, a_ref=0.0):
     (x1, z1), (x2, z2) = p1, p2
     dz = z2 - z1
     if abs(dz) < separation:
         return None
     a = (x2 - x1) / dz
-    if abs(a) > max_slope:
+    if abs(a - a_ref) > max_slope:
         return None
     return a, x1 - a * z1
 
 
+def coverage(points, mask):
+    """Number of distinct z-bins containing at least one inlier (blobs don't count more than once per bin)."""
+    zb = np.clip(((points[mask, 1] - Z_RANGE[0]) / COV_BIN_M).astype(int), 0, None)
+    return int(np.count_nonzero(np.bincount(zb)))
+
+
 def ransac(points, threshold=INLINER_TRESHOLD_M, min_inliers=MIN_INLIERS, max_iter=MAX_ITER,
-            p=SUCCESS_PROBABILITY, max_slope=MAX_SLOPE, sep_min=MIN_SEPARATION_M, seed=0):
+            p=SUCCESS_PROBABILITY, max_slope=MAX_SLOPE, sep_min=MIN_SEPARATION_M, seed=0, a_ref=0.0):
     N = len(points)
     if N < max(2, min_inliers):
         return None
     rng = np.random.default_rng(seed)
-    best, n_best, best_mask = None, 0, None
+    best, n_best, cov_best, best_mask = None, 0, 0, None
     k, n_iter, attempts = max_iter, 0, 0
     while n_iter < min(k, max_iter) and attempts < 50 * max_iter:
         attempts += 1
         i, j = rng.integers(0, N, size=2)
-        line = line_fit(points[i], points[j], separation=sep_min, max_slope=max_slope)
+        line = line_fit(points[i], points[j], separation=sep_min, max_slope=max_slope, a_ref=a_ref)
         if line is not None:
             a, b = line
             n_iter += 1
             inliers = line_distance(points, a, b) <= threshold
-            n_inliers = int(inliers.sum())
-            if n_inliers > n_best:
-                best, n_best, best_mask = (a, b), n_inliers, inliers
+            cov = coverage(points, inliers)
+            if cov > cov_best:
+                best, n_best, cov_best, best_mask = (a, b), int(inliers.sum()), cov, inliers
                 k = n_iteration(p, n_best / N)
     if best is None or n_best < min_inliers:
         return None
     a, b = np.polyfit(points[best_mask, 1], points[best_mask, 0], 1)
-    if abs(a) > max_slope:
-        return None
+    if abs(a - a_ref) > max_slope:
+        a, b = best                       # refit drifted out of the slope gate: keep the hypothesis that passed it
     best_mask = line_distance(points, a, b) <= threshold
     if int(best_mask.sum()) < min_inliers:
         return None
     return dict(a=float(a), b=float(b), inliers=best_mask, n_iter=n_iter)
-
 
 # ---------------- candidates ----------------
 def x_at(line, z=None):
@@ -157,7 +193,7 @@ def x_at(line, z=None):
     return line["a"] * z + line["b"]
 
 
-def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
+def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M, a_ref=0.0):
     """
     Sequential RANSAC over ALL points: find the best line, remove the points near it
     (band 2*threshold, so the other edge of the same line is not picked again), and repeat.
@@ -169,7 +205,7 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
         if len(remaining) < MIN_INLIERS:
             break
         sub = points[remaining]
-        r = ransac(sub)
+        r = ransac(sub, max_slope=SLOPE_TOL, a_ref=a_ref)
         if r is None:
             break
         full_mask = np.zeros(len(points), dtype=bool)
@@ -179,18 +215,6 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
         near = line_distance(sub, r["a"], r["b"]) <= 2 * threshold
         remaining = remaining[~near]
     return cands
-
-
-def road_edge_candidate(road, safe, direction):
-    p = road_edge_points(road, safe, direction)
-    if len(p) < ROAD_EDGE_MIN_INLIERS:
-        return None
-    r = ransac(p, threshold=ROAD_EDGE_THRESHOLD_M, min_inliers=ROAD_EDGE_MIN_INLIERS)
-    if r is None:
-        return None
-    r["inliers"] = None
-    r["edge"] = True
-    return r
 
 
 def _rank(c):
@@ -252,13 +276,20 @@ def line_on_image(line, M_inv, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER
     return cv2.perspectiveTransform(points_px, M_inv).reshape(-1, 2)
 
 
-def draw_lanes(img, M_inv, lanes, alpha=0.35):
-    """Paint the whole carriageway green: from the leftmost to the rightmost line."""
-    left, right = lanes[0][0], lanes[-1][1]
-    area = np.vstack((line_on_image(left, M_inv), line_on_image(right, M_inv)[::-1])).astype(np.int32)
+def draw_lanes(img, M_inv, lanes, alpha=0.35, thickness=4):
+    """Fill each lane (ego green, others red), then draw only the lines that bound the lanes."""
     overlay = img.copy()
-    cv2.fillPoly(overlay, [area], (0, 255, 0))
-    return cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
+    for left, right, is_ego in lanes:
+        area = np.vstack((line_on_image(left, M_inv), line_on_image(right, M_inv)[::-1])).astype(np.int32)
+        cv2.fillPoly(overlay, [area], EGO_FILL if is_ego else OTHER_FILL)
+    out = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
+
+    # unique boundaries, left to right: first left line + the right line of every lane
+    boundaries = [lanes[0][0]] + [ln[1] for ln in lanes]
+    for k, line in enumerate(boundaries):
+        pts = line_on_image(line, M_inv).astype(np.int32)
+        cv2.polylines(out, [pts], False, LINE_COLORS[k % len(LINE_COLORS)], thickness, cv2.LINE_AA)
+    return out
 
 
 # ---------------- main function ----------------
@@ -270,6 +301,9 @@ def lane_fitting(pipe, img):
     safe = cv2.erode(pipe["valid"].astype(np.uint8), np.ones((17, 17), np.uint8)) > 0
     edge_l = road_edge_candidate(pipe["road"], safe, -1)
     edge_r = road_edge_candidate(pipe["road"], safe, +1)
+    raw_edges = [e for e in (edge_l, edge_r) if e]
+    a_ref = float(np.mean([e["a"] for e in raw_edges])) if raw_edges else 0.0
+    cands = find_candidates(pts, a_ref=a_ref)
     edge_l = snap_edge(edge_l, cands, pipe["road"], -1)
     edge_r = snap_edge(edge_r, cands, pipe["road"], +1)
     lanes = build_lanes(cands, edge_l, edge_r)
