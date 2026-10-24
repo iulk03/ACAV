@@ -3,8 +3,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import lane_fitting as lf
 
-import road_classifier as rc
-#import net_classifier as nc
+#import road_classifier as nc
+import net_classifier as nc
 
 X_RANGE = (-7.0, 7.0)       # road width in metres
 Z_RANGE = (7.0, 20.0)       # road depth in metres
@@ -148,17 +148,16 @@ def lane_pipeline(calib_path, img, out_path=None):
     grad = line_ridge(gray, valid).astype(np.float64)
 
     # 2) classifier branch (from swami): road mask, road contour, colour edges
-    road_u8 = rc.road_mask_bev(bev, valid)              # uint8 0/255
+    road_u8 = nc.road_mask_bev(bev, valid)              # uint8 0/255
     road_ok = (road_u8 > 0).mean() > MIN_ROAD_FRAC
     if road_ok:
         road = road_u8 > 0
         # painted lines are searched only well inside the road
         safe = cv2.erode(valid.astype(np.uint8), np.ones((17, 17), np.uint8)) > 0
-        edge_l = lf.road_edge_candidate(road, safe, -1)
-        edge_r = lf.road_edge_candidate(road, safe, +1)
+        edge_l, edge_r = lf.road_edges(road, safe)
         wedge = road_wedge(edge_l, edge_r, road.shape)
         region = cv2.erode((road | wedge).astype(np.uint8), np.ones((ROAD_ERODE_PX, ROAD_ERODE_PX), np.uint8)) > 0
-        road_edge = rc.road_edge(road_u8, valid)        # road contour, used as separate edge candidates
+        road_edge = nc.road_edge(road_u8, valid)        # road contour, used as separate edge candidates
     else:
         road_u8 = np.zeros_like(road_u8)                # failed mask: no road-edge candidates either
         road = np.zeros(road_u8.shape, dtype=bool)
@@ -166,7 +165,7 @@ def lane_pipeline(calib_path, img, out_path=None):
         road_edge = np.zeros_like(road_u8)
 
     grad_thr = threshold(grad, region)
-    chroma = rc.chroma_edges(bev, valid)                # colour edges: asphalt/grass, painted lines
+    chroma = nc.chroma_edges(bev, valid)                # colour edges: asphalt/grass, painted lines
     thresh = cv2.bitwise_or(grad_thr, chroma)           # what RANSAC sees (road edge stays separate)
 
     if out_path is not None:

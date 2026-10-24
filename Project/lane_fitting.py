@@ -11,21 +11,24 @@ MIN_SEPARATION_M = 2.0      # min z distance between the two points defining a l
 SUCCESS_PROBABILITY = 0.99
 MAX_ITER = 500
 MIN_INLIERS = 100
-MAX_SLOPE = 0.25            # max slope of a single line (x = a*z + b)
+MAX_SLOPE = 0.4            # max slope of a single line (x = a*z + b)
 SLOPE_TOL = 0.06            # painted lines: |a - a_ref| <= SLOPE_TOL, a_ref from the road edges
 COV_BIN_M = 0.1             # z-bin used to measure how much of the line is actually covered
 SNAP_MIN_SCORE = 0.3        # fraction of the line length that must look like a road boundary
 SNAP_OFFSET_M = 0.3
 
 # ---------------- candidate and lane parameters ----------------
+SNAP_EDGES = False          # True = replace the road edge with the innermost painted line
+
 N_CANDIDATES = 10           # how many candidate lines to search for
-SLOPE_DELTA_MAX = 0.5       # max slope difference to be considered parallel
-MERGE_DIST_M = 2.0          # lines closer than this (in x) are merged
+SLOPE_DELTA_MAX = 0.4       # max slope difference to be considered parallel
+MERGE_DIST_M = 2.5          # lines closer than this (in x) are merged
 ROAD_EDGE_THRESHOLD_M = 0.25
 ROAD_EDGE_MIN_INLIERS = 40
 MIN_SUPPORT_FRAC = 0.2      # painted lines with fewer inliers than 20% of the best one are dropped
 MIN_LANE_WIDTH_M = 2.0      # painted line vs painted line
 ROAD_GAP_M = 3.5            # max non-road gap between the vehicle column and the first road run (shadow holes)
+EDGE_PARALLEL_TOL = 0.12 
 
 CAND_COLORS = ["red", "cyan", "lime", "magenta", "orange", "dodgerblue", "gold", "deeppink", "white", "mediumpurple"]
 EGO_FILL = (0, 255, 0)      # RGB: ego lane
@@ -75,53 +78,91 @@ def points_in_meters(img_thresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_R
     return dict(x=x, z=z)
 
 
-def road_edge_points(road, safe, direction, tolerant=False):
+def road_edge_points(road, safe, direction, mode="strict"):
     """
     strict   : the vehicle column must be road; edge = first road -> non-road transition outward.
     tolerant : if the vehicle column is not road, use the outer end of the first road run
                found within ROAD_GAP_M.
+    extreme  : last resort, outermost road pixel of every row on the requested side of the vehicle.
     """
     h, w = road.shape
     c = w // 2
     max_gap = int(ROAD_GAP_M * PX_PER_M)
     xs, zs = [], []
     for r in range(h):
-        seg = road[r, c:] if direction > 0 else road[r, :c + 1][::-1]
-        if seg[0]:
-            start = 0                              # strict case: vehicle column is road
-        elif tolerant:
-            hits = np.flatnonzero(seg)
-            if len(hits) == 0 or hits[0] > max_gap:
-                continue                           # no road nearby / hole too wide
-            start = hits[0]
+        if mode == "extreme":
+            cols = np.flatnonzero(road[r])
+            if len(cols) == 0:
+                continue
+            col = cols[-1] + 1 if direction > 0 else cols[0] - 1
+            if not (0 <= col < w) or direction * (col - c) <= 0 or not safe[r, col]:
+                continue
         else:
-            continue
-        end = np.flatnonzero(~seg[start:])
-        if len(end) == 0:
-            continue                               # road touches the border
-        k = start + end[0]                         # first non-road pixel after the run
-        col = c + k if direction > 0 else c - k
-        if not safe[r, col]:
-            continue                               # boundary is fake
+            seg = road[r, c:] if direction > 0 else road[r, :c + 1][::-1]
+            if seg[0]:
+                start = 0
+            elif mode == "tolerant":
+                hits = np.flatnonzero(seg)
+                if len(hits) == 0 or hits[0] > max_gap:
+                    continue
+                start = hits[0]
+            else:
+                continue
+            end = np.flatnonzero(~seg[start:])
+            if len(end) == 0:
+                continue
+            k = start + end[0]
+            col = c + k if direction > 0 else c - k
+            if not safe[r, col]:
+                continue
         xs.append(X_RANGE[0] + col / PX_PER_M)
         zs.append(Z_RANGE[1] - r / PX_PER_M)
     return np.column_stack((xs, zs)) if xs else np.empty((0, 2))
 
 
 def road_edge_candidate(road, safe, direction):
-    """Try the strict extraction first; fall back to the tolerant one only if it yields no valid line."""
-    for tolerant in (False, True):
-        p = road_edge_points(road, safe, direction, tolerant=tolerant)
+    """Strict -> tolerant -> extreme: the first mode that yields a valid line wins."""
+    for mode in ("strict", "tolerant", "extreme"):
+        p = road_edge_points(road, safe, direction, mode=mode)
         if len(p) < ROAD_EDGE_MIN_INLIERS:
             continue
         r = ransac(p, threshold=ROAD_EDGE_THRESHOLD_M, min_inliers=ROAD_EDGE_MIN_INLIERS)
         if r is None:
             continue
+        r["length"] = coverage(p, r["inliers"]) * COV_BIN_M    # straight length (m) covered by the inliers
+        r["n_inl"] = int(r["inliers"].sum())
         r["inliers"] = None
         r["edge"] = True
-        r["tolerant"] = tolerant           # for debugging
+        r["mode"] = mode                   # for debugging
         return r
     return None
+
+
+def road_edges(road, safe):
+    """
+    Left and right road edges. If their slopes differ by more than EDGE_PARALLEL_TOL, the longer one
+    is trusted and the other is rebuilt with the same slope, through the outermost point of the
+    road-mask boundary on its side.
+    """
+    edge_l = road_edge_candidate(road, safe, -1)
+    edge_r = road_edge_candidate(road, safe, +1)
+    if edge_l is None or edge_r is None or abs(edge_l["a"] - edge_r["a"]) <= EDGE_PARALLEL_TOL:
+        return edge_l, edge_r
+
+    left_is_strong = (edge_l["length"], edge_l["n_inl"]) >= (edge_r["length"], edge_r["n_inl"])
+    strong, weak, side = (edge_l, edge_r, +1) if left_is_strong else (edge_r, edge_l, -1)
+
+    p = road_edge_points(road, safe, side, mode=weak["mode"])    # boundary points of the weak side
+    if len(p) == 0:
+        return edge_l, edge_r
+    x_out, z_out = p[np.argmax(side * p[:, 0])]                  # outermost point (max x right, min x left)
+    a = strong["a"]
+    fixed = dict(weak, a=a, b=float(x_out - a * z_out), estimated=True)
+
+    z = np.array(Z_RANGE)                                        # the rebuilt edge must stay on its own side
+    if np.any(side * ((fixed["a"] * z + fixed["b"]) - (strong["a"] * z + strong["b"])) <= 0):
+        return edge_l, edge_r
+    return (edge_l, fixed) if left_is_strong else (fixed, edge_r)
 
 
 # ---------------- RANSAC (one line) ----------------
@@ -297,15 +338,15 @@ def lane_fitting(pipe, img):
     pts_dict = points_in_meters(pipe["thresh"])
     pts = np.column_stack((pts_dict["x"], pts_dict["z"]))
 
-    cands = find_candidates(pts)
     safe = cv2.erode(pipe["valid"].astype(np.uint8), np.ones((17, 17), np.uint8)) > 0
-    edge_l = road_edge_candidate(pipe["road"], safe, -1)
-    edge_r = road_edge_candidate(pipe["road"], safe, +1)
+    edge_l, edge_r = road_edges(pipe["road"], safe)
     raw_edges = [e for e in (edge_l, edge_r) if e]
     a_ref = float(np.mean([e["a"] for e in raw_edges])) if raw_edges else 0.0
+
     cands = find_candidates(pts, a_ref=a_ref)
-    edge_l = snap_edge(edge_l, cands, pipe["road"], -1)
-    edge_r = snap_edge(edge_r, cands, pipe["road"], +1)
+    if SNAP_EDGES:
+        edge_l = snap_edge(edge_l, cands, pipe["road"], -1)
+        edge_r = snap_edge(edge_r, cands, pipe["road"], +1)
     lanes = build_lanes(cands, edge_l, edge_r)
     ego = next((ln for ln in lanes if ln[2]), None)
 
