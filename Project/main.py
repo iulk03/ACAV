@@ -8,16 +8,18 @@ BASE_DIR = Path(__file__).resolve().parent
 ROOT = BASE_DIR / "data_road"
 OUT_DIR = BASE_DIR / "debug_images"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+OPTIONS = {'um':94, 'uum':95, 'uu':97}
 
-SINGLE = 45 # set this variable to a number to process one image, None to process all the images
+# set this variable to a number to process one image, None to process all the images, w to process only wrongly detected images
+SINGLE = 'w'
+TYPE, TOT_IMG = list(OPTIONS.items())[0] # depending which type of raod we want to check
 
-um = sorted(glob.glob(f"{ROOT}/training/image_2/um_*.png"))
+type = sorted(glob.glob(f"{ROOT}/training/image_2/{TYPE}_*.png"))
 
-# wrong in: 44, 45
-wrong = [44, 45]
+wrong = [44, 70]
 
 def execute(img_idx, name_flag):
-    image_path = Path(um[img_idx])
+    image_path = Path(type[img_idx])
     stem = image_path.stem
     img = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
     calib_path = ROOT / "training" / "calib" / f"{stem}.txt"
@@ -39,9 +41,10 @@ def execute(img_idx, name_flag):
         print(f"No lane found. Points: {len(out['pts'])}; painted candidates: {len(out['candidates'])}; "f"road edges: {len(out['edges'])}")
 
 if SINGLE is None:
-    for idx in range(94):
+    for idx in range(TOT_IMG):
+        execute(idx, True)
+elif SINGLE == 'w':
+    for idx in wrong:
         execute(idx, True)
 else:
-    #execute(SINGLE, False)
-    for idx in wrong:
-        execute(idx, False)
+    execute(SINGLE, False)

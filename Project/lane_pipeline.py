@@ -104,12 +104,19 @@ def threshold(grad, region, percentile=PERCENTILE, min_grad=MIN_GRAD, block=BLOC
     return out
 
 
-def line_ridge(gray, valid):
-    """Thin bright vertical structures only: shadow edges are steps, not ridges, so they are suppressed."""
+def slanted_kernel(a, length=LINE_MIN_LEN_PX):
+    """Thin line kernel following x = a*z in the BEV (row 0 = far end)."""
+    w = int(np.ceil(abs(a) * length)) + 1
+    k = np.zeros((length, w), np.uint8)
+    top, bottom = ((w - 1, 0), (0, length - 1)) if a > 0 else ((0, 0), (w - 1, length - 1))
+    cv2.line(k, top, bottom, 1, 1)
+    return k
+
+
+def line_ridge(gray, valid, a=0.0):
     k_w = cv2.getStructuringElement(cv2.MORPH_RECT, (LINE_WIDTH_PX, 1))
-    k_l = cv2.getStructuringElement(cv2.MORPH_RECT, (1, LINE_MIN_LEN_PX))
     ridge = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, k_w)
-    ridge = cv2.morphologyEx(ridge, cv2.MORPH_OPEN, k_l)
+    ridge = cv2.morphologyEx(ridge, cv2.MORPH_OPEN, slanted_kernel(a))
     return ridge * valid
 
 
@@ -142,31 +149,33 @@ def lane_pipeline(calib_path, img, out_path=None):
     valid = cv2.warpPerspective(np.full(img.shape[:2], 255, np.uint8), M, (w, h),
                                 flags=cv2.INTER_NEAREST) > 0
 
-    # 1) gradient branch: painted-line candidates
     gray = gaussian_filter(bev)
-    #grad = gradient_filter(gray) * valid ----------------------------------------------------------------------  HERE
-    grad = line_ridge(gray, valid).astype(np.float64)
 
-    # 2) classifier branch (from swami): road mask, road contour, colour edges
+    # 1) classifier branch: road mask, road contour, colour edges
     road_u8 = nc.road_mask_bev(bev, valid)              # uint8 0/255
     road_ok = (road_u8 > 0).mean() > MIN_ROAD_FRAC
+    edge_l = edge_r = None                              # defined in both branches
     if road_ok:
         road = road_u8 > 0
-        # painted lines are searched only well inside the road
         safe = cv2.erode(valid.astype(np.uint8), np.ones((17, 17), np.uint8)) > 0
         edge_l, edge_r = lf.road_edges(road, safe)
         wedge = road_wedge(edge_l, edge_r, road.shape)
         region = cv2.erode((road | wedge).astype(np.uint8), np.ones((ROAD_ERODE_PX, ROAD_ERODE_PX), np.uint8)) > 0
-        road_edge = nc.road_edge(road_u8, valid)        # road contour, used as separate edge candidates
+        road_edge = nc.road_edge(road_u8, valid)
     else:
-        road_u8 = np.zeros_like(road_u8)                # failed mask: no road-edge candidates either
+        road_u8 = np.zeros_like(road_u8)
         road = np.zeros(road_u8.shape, dtype=bool)
         region = cv2.erode(valid.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
         road_edge = np.zeros_like(road_u8)
 
+    # 2) gradient branch: painted-line candidates, ridge kernel oriented like the road
+    edges = [e for e in (edge_l, edge_r) if e]
+    a_ref = float(np.mean([e["a"] for e in edges])) if edges else 0.0
+    grad = line_ridge(gray, valid, a=a_ref).astype(np.float64)
+
     grad_thr = threshold(grad, region)
-    chroma = nc.chroma_edges(bev, valid)                # colour edges: asphalt/grass, painted lines
-    thresh = cv2.bitwise_or(grad_thr, chroma)           # what RANSAC sees (road edge stays separate)
+    chroma = nc.chroma_edges(bev, valid)
+    thresh = cv2.bitwise_or(grad_thr, chroma)
 
     if out_path is not None:
         vis = img.copy()
@@ -183,8 +192,7 @@ def lane_pipeline(calib_path, img, out_path=None):
             ("Final threshold", thresh, "gray"),
         ], out_path)
 
-    return dict(M=M, M_inv=M_inv, thresh=thresh, road_edge=road_edge,
-                road=road, valid=valid, gray=gray, grad=grad)
+    return dict(M=M, M_inv=M_inv, thresh=thresh, road_edge=road_edge, road=road, valid=valid, gray=gray, grad=grad, grad_thr=grad_thr)
 
 
 def save_panels(panels, out_path, ncols=3):

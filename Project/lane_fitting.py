@@ -14,25 +14,33 @@ MIN_INLIERS = 100
 MAX_SLOPE = 0.4            # max slope of a single line (x = a*z + b)
 SLOPE_TOL = 0.06            # painted lines: |a - a_ref| <= SLOPE_TOL, a_ref from the road edges
 COV_BIN_M = 0.1             # z-bin used to measure how much of the line is actually covered
-SNAP_MIN_SCORE = 0.3        # fraction of the line length that must look like a road boundary
-SNAP_OFFSET_M = 0.3
 
 # ---------------- candidate and lane parameters ----------------
-SNAP_EDGES = False          # True = replace the road edge with the innermost painted line
+SNAP_MAX_DIST_M = 0.8           # a painted line replaces the mask edge only if it is this close to it
+SNAP_MIN_COV_FRAC = 0.5         # ... and covers at least this fraction of the BEV depth
+INTERIOR_MIN_SCORE_FRAC = 0.4   # interior line score vs the best interior line
+EDGE_BAND_M = 0.3               # RANSAC points are searched between the edges, widened by this band
+NARROW_MIN_COV_FRAC = 0.4       # a line closer than MIN_LANE_WIDTH_M to a road edge must cover at least this fraction of the BEV depth
 
-N_CANDIDATES = 10           # how many candidate lines to search for
-SLOPE_DELTA_MAX = 0.4       # max slope difference to be considered parallel
-MERGE_DIST_M = 2.5          # lines closer than this (in x) are merged
+N_CANDIDATES = 10               # how many candidate lines to search for
+SLOPE_DELTA_MAX = 0.4           # max slope difference to be considered parallel
+MERGE_DIST_M = 2.0              # painted line vs road edge: closer than this = duplicate of the edge marking
+MIN_LANE_WIDTH_M = 2.5          # painted vs painted: no real lane is narrower than this
 ROAD_EDGE_THRESHOLD_M = 0.25
 ROAD_EDGE_MIN_INLIERS = 40
-MIN_SUPPORT_FRAC = 0.2      # painted lines with fewer inliers than 20% of the best one are dropped
-MIN_LANE_WIDTH_M = 2.0      # painted line vs painted line
-ROAD_GAP_M = 3.5            # max non-road gap between the vehicle column and the first road run (shadow holes)
-EDGE_PARALLEL_TOL = 0.12 
+ROAD_GAP_M = 3.5                # max non-road gap between the vehicle column and the first road run (shadow holes)
+EDGE_PARALLEL_TOL = 0.12
+EGO_Z_M = 0.0
+PAINT_MIN_FRAC = 0.3            # start at 0.0 (filter off): first measure, then set it
+
+RIDGE_REF_PCT = 99.9        # reference ridge strength: this percentile of the ridge image
+RIDGE_STRONG_FRAC = 0.3     # a z-bin counts as "on paint" if the ridge near the line exceeds this fraction of the reference
+RIDGE_HALF_W_M = 0.15       # half-width of the window around the line where the ridge is searched
+RIDGE_BONUS = 2.0           # score bonus per metre of line lying on a strong ridge
 
 CAND_COLORS = ["red", "cyan", "lime", "magenta", "orange", "dodgerblue", "gold", "deeppink", "white", "mediumpurple"]
-EGO_FILL = (0, 255, 0)      # RGB: ego lane
-OTHER_FILL = (255, 0, 0)    # RGB: every other lane
+EGO_FILL = (0, 255, 0)          # RGB: ego lane
+OTHER_FILL = (255, 0, 0)        # RGB: every other lane
 
 def cv2_color(name):
     """Matplotlib colour name -> RGB tuple 0-255 for cv2 (the images are RGB)."""
@@ -40,31 +48,61 @@ def cv2_color(name):
 
 LINE_COLORS = [cv2_color("magenta"), cv2_color("yellow"), cv2_color("blue")]
 
-def boundary_score(c, road, side):
-    """Fraction of the line where the inner side is road and the outer side is not."""
-    h, w = road.shape
-    z = np.linspace(Z_RANGE[0] + 0.5, Z_RANGE[1] - 0.5, 60)
-    x = c["a"] * z + c["b"]
-    rows = ((Z_RANGE[1] - z) * PX_PER_M).astype(int)
-    c_in = ((x - side * SNAP_OFFSET_M - X_RANGE[0]) * PX_PER_M).astype(int)
-    c_out = ((x + side * SNAP_OFFSET_M - X_RANGE[0]) * PX_PER_M).astype(int)
-    ok = (rows >= 0) & (rows < h) & (c_in >= 0) & (c_in < w) & (c_out >= 0) & (c_out < w)
-    if not ok.any():
-        return 0.0
-    hit = road[rows[ok], c_in[ok]] & ~road[rows[ok], c_out[ok]]
-    return float(hit.sum()) / len(z)          # normalised by the full length, not only the visible part
+
+def snap_edge(edge, cands):
+    """Replace the mask edge with a well-covered painted line lying right next to it."""
+    if edge is None:
+        return None
+    span = Z_RANGE[1] - Z_RANGE[0]
+    near = [c for c in cands if abs(x_at(c) - x_at(edge)) <= SNAP_MAX_DIST_M and c["cov_m"] >= SNAP_MIN_COV_FRAC * span]
+    if not near:
+        return edge
+    best = max(near, key=line_score)
+    return dict(best, edge=True, n_inl=int(best["inliers"].sum()), snapped=True)
 
 
-def snap_edge(edge, cands, road, side):
-    """Replace the RANSAC road edge with the innermost painted line that behaves like a boundary."""
-    on_side = [c for c in cands if side * x_at(c) > 0]
-    on_side.sort(key=lambda c: side * x_at(c))                 # innermost first
-    for c in on_side:
-        if boundary_score(c, road, side) >= SNAP_MIN_SCORE:
-            if edge is None or side * x_at(c) < side * x_at(edge):
-                return dict(c, edge=True)
+def select_interior(cands, left_edge, right_edge):
+    """Greedy NMS: strongest painted line first, rejected if too close to a line already kept."""
+    edges = [e for e in (left_edge, right_edge) if e]
+    span = Z_RANGE[1] - Z_RANGE[0]
+
+    def narrow_ok(c):
+        # a line squeezed between 2.0 and 2.5 m from an edge is accepted only with strong evidence
+        near_edge = any(abs(x_at(c) - x_at(e)) < MIN_LANE_WIDTH_M for e in edges)
+        return not near_edge or c["cov_m"] >= NARROW_MIN_COV_FRAC * span
+
+    pool = [c for c in filter_parallel(cands, edges) if c["paint"] >= PAINT_MIN_FRAC and narrow_ok(c)]
+    if left_edge:
+        pool = [c for c in pool if x_at(c) > x_at(left_edge) + MERGE_DIST_M]
+    if right_edge:
+        pool = [c for c in pool if x_at(c) < x_at(right_edge) - MERGE_DIST_M]
+    pool.sort(key=line_score, reverse=True)
+    keep = list(edges)
+    for c in pool:
+        if line_score(c) < INTERIOR_MIN_SCORE_FRAC * line_score(pool[0]):
             break
-    return edge
+        if all(abs(x_at(c) - x_at(k)) >= (MERGE_DIST_M if k.get("edge") else MIN_LANE_WIDTH_M) for k in keep):
+            keep.append(c)
+    keep.sort(key=x_at)
+
+    # an estimated edge is only a guess: if a painted line already bounds the road on the non-ego side, drop it
+    if len(keep) >= 3:
+        if keep[0].get("estimated") and not keep[1].get("edge") and x_at(keep[1], EGO_Z_M) < 0:
+            keep = keep[1:]
+        if len(keep) >= 3 and keep[-1].get("estimated") and not keep[-2].get("edge") and x_at(keep[-2], EGO_Z_M) > 0:
+            keep = keep[:-1]
+    return keep
+
+
+def restrict_to_edges(pts_dict, edge_l, edge_r, band=EDGE_BAND_M):
+    """Keep only the points between the two mask edges (a missing edge leaves that side open)."""
+    keep = np.ones(len(pts_dict["x"]), bool)
+    z = pts_dict["z"]
+    if edge_l:
+        keep &= pts_dict["x"] >= edge_l["a"] * z + edge_l["b"] - band
+    if edge_r:
+        keep &= pts_dict["x"] <= edge_r["a"] * z + edge_r["b"] + band
+    return {k: v[keep] for k, v in pts_dict.items()}
 
 
 # ---------------- binary image -> road coordinates ----------------
@@ -75,7 +113,7 @@ def points_in_meters(img_thresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_R
     row, column = row[ok], column[ok]
     x = x_range[0] + column / px_per_m
     z = z_range[1] - row / px_per_m
-    return dict(x=x, z=z)
+    return dict(x=x, z=z, row=row, column=column)
 
 
 def road_edge_points(road, safe, direction, mode="strict"):
@@ -196,6 +234,23 @@ def coverage(points, mask):
     return int(np.count_nonzero(np.bincount(zb)))
 
 
+def ridge_cov(c, grad, ref):
+    """Metres of the line (z-bins of COV_BIN_M) where the ridge response near the line exceeds RIDGE_STRONG_FRAC * ref."""
+    h, w = grad.shape
+    z = np.arange(Z_RANGE[0] + COV_BIN_M / 2, Z_RANGE[1], COV_BIN_M)
+    rows = np.clip(((Z_RANGE[1] - z) * PX_PER_M).astype(int), 0, h - 1)
+    cols = (c["a"] * z + c["b"] - X_RANGE[0]) * PX_PER_M
+    half = int(round(RIDGE_HALF_W_M * PX_PER_M))
+    hit = 0
+    for r, col in zip(rows, cols):
+        c0, c1 = int(col) - half, int(col) + half + 1
+        if c1 <= 0 or c0 >= w:
+            continue
+        if grad[r, max(c0, 0):c1].max() > RIDGE_STRONG_FRAC * ref:
+            hit += 1
+    return hit * COV_BIN_M
+
+
 def ransac(points, threshold=INLINER_TRESHOLD_M, min_inliers=MIN_INLIERS, max_iter=MAX_ITER,
             p=SUCCESS_PROBABILITY, max_slope=MAX_SLOPE, sep_min=MIN_SEPARATION_M, seed=0, a_ref=0.0):
     N = len(points)
@@ -258,6 +313,12 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M, a_ref=
     return cands
 
 
+def line_score(c):
+    """Metres covered, plus a bonus for the metres lying on a strong ridge (bright paint). Lines without paint keep their cov_m."""
+    return c["cov_m"] + RIDGE_BONUS * c.get("ridge_m", 0.0)
+
+
+# at the moment unused
 def _rank(c):
     """Road edges always win a merge; among painted lines, the one with more inliers wins."""
     return (1, 0) if c.get("edge") else (0, int(c["inliers"].sum()))
@@ -277,6 +338,7 @@ def filter_parallel(cands, edges):
     return [c for c in cands if abs(c["a"] - a_ref) < SLOPE_DELTA_MAX]
 
 
+# at the moment unused
 def merge_close(lines):
     out = []
     for c in sorted(lines, key=x_at):
@@ -292,18 +354,9 @@ def merge_close(lines):
 
 
 def build_lanes(cands, left_edge, right_edge):
-    edges = [e for e in (left_edge, right_edge) if e]
-    painted = filter_parallel(cands, edges)
-    if painted:
-        best = max(int(c["inliers"].sum()) for c in painted)
-        painted = [c for c in painted if c["inliers"].sum() >= MIN_SUPPORT_FRAC * best]
-    if left_edge:
-        painted = [c for c in painted if x_at(c) > x_at(left_edge) + MERGE_DIST_M]
-    if right_edge:
-        painted = [c for c in painted if x_at(c) < x_at(right_edge) - MERGE_DIST_M]
-    lines = merge_close(painted + edges)
-    z_ego = Z_RANGE[0]
-    return [[l, r, x_at(l, z_ego) < 0 < x_at(r, z_ego)] for l, r in zip(lines[:-1], lines[1:])]
+    left_edge, right_edge = snap_edge(left_edge, cands), snap_edge(right_edge, cands)
+    lines = select_interior(cands, left_edge, right_edge)
+    return [[l, r, x_at(l, EGO_Z_M) < 0 < x_at(r, EGO_Z_M)] for l, r in zip(lines[:-1], lines[1:])]
 
 
 # ---------------- drawing ----------------
@@ -335,18 +388,21 @@ def draw_lanes(img, M_inv, lanes, alpha=0.35, thickness=4):
 
 # ---------------- main function ----------------
 def lane_fitting(pipe, img):
-    pts_dict = points_in_meters(pipe["thresh"])
-    pts = np.column_stack((pts_dict["x"], pts_dict["z"]))
-
     safe = cv2.erode(pipe["valid"].astype(np.uint8), np.ones((17, 17), np.uint8)) > 0
     edge_l, edge_r = road_edges(pipe["road"], safe)
     raw_edges = [e for e in (edge_l, edge_r) if e]
     a_ref = float(np.mean([e["a"] for e in raw_edges])) if raw_edges else 0.0
 
+    pts_dict = restrict_to_edges(points_in_meters(pipe["thresh"]), edge_l, edge_r)
+    pts = np.column_stack((pts_dict["x"], pts_dict["z"]))
     cands = find_candidates(pts, a_ref=a_ref)
-    if SNAP_EDGES:
-        edge_l = snap_edge(edge_l, cands, pipe["road"], -1)
-        edge_r = snap_edge(edge_r, cands, pipe["road"], +1)
+    paint = pipe["grad_thr"][pts_dict["row"], pts_dict["column"]] > 0
+    grad_ref = float(np.percentile(pipe["grad"][pipe["valid"]], RIDGE_REF_PCT))
+    for c in cands:
+        c["paint"] = float(paint[c["inliers"]].mean())
+        c["cov_m"] = coverage(pts, c["inliers"]) * COV_BIN_M
+        c["ridge_m"] = ridge_cov(c, pipe["grad"], grad_ref)
+
     lanes = build_lanes(cands, edge_l, edge_r)
     ego = next((ln for ln in lanes if ln[2]), None)
 
