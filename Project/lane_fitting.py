@@ -42,15 +42,17 @@ CAND_COLORS = ["red", "cyan", "lime", "magenta", "orange", "dodgerblue", "gold",
 EGO_FILL = (0, 255, 0)          # RGB: ego lane
 OTHER_FILL = (255, 0, 0)        # RGB: every other lane
 
+
 def cv2_color(name):
-    """Matplotlib colour name -> RGB tuple 0-255 for cv2 (the images are RGB)."""
+    """Convert a Matplotlib color name into the RGB tuple expected by OpenCV for drawing."""
     return tuple(int(255 * v) for v in mcolors.to_rgb(name))
+
 
 LINE_COLORS = [cv2_color("magenta"), cv2_color("yellow"), cv2_color("blue")]
 
 
 def snap_edge(edge, cands):
-    """Replace the mask edge with a well-covered painted line lying right next to it."""
+    """Replace a road edge with the strongest nearby painted lane candidate if it matches that edge well."""
     if edge is None:
         return None
     span = Z_RANGE[1] - Z_RANGE[0]
@@ -62,7 +64,7 @@ def snap_edge(edge, cands):
 
 
 def select_interior(cands, left_edge, right_edge):
-    """Greedy NMS: strongest painted line first, rejected if too close to a line already kept."""
+    """Pick the most credible interior lane marks while ignoring duplicates and weak edge-like candidates."""
     edges = [e for e in (left_edge, right_edge) if e]
     span = Z_RANGE[1] - Z_RANGE[0]
 
@@ -95,7 +97,7 @@ def select_interior(cands, left_edge, right_edge):
 
 
 def restrict_to_edges(pts_dict, edge_l, edge_r, band=EDGE_BAND_M):
-    """Keep only the points between the two mask edges (a missing edge leaves that side open)."""
+    """Keep only points lying inside the valid road band between the left and right edges."""
     keep = np.ones(len(pts_dict["x"]), bool)
     z = pts_dict["z"]
     if edge_l:
@@ -107,6 +109,7 @@ def restrict_to_edges(pts_dict, edge_l, edge_r, band=EDGE_BAND_M):
 
 # ---------------- binary image -> road coordinates ----------------
 def points_in_meters(img_thresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_RANGE, margin_px=MARGIN_PX):
+    """Convert a thresholded bird's-eye-view mask into meter-based x/z coordinates for lane fitting."""
     height, width = img_thresh.shape
     row, column = np.nonzero(img_thresh)
     ok = (row >= margin_px) & (row < height - margin_px) & (column >= margin_px) & (column < width - margin_px)
@@ -118,10 +121,8 @@ def points_in_meters(img_thresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_R
 
 def road_edge_points(road, safe, direction, mode="strict"):
     """
-    strict   : the vehicle column must be road; edge = first road -> non-road transition outward.
-    tolerant : if the vehicle column is not road, use the outer end of the first road run
-               found within ROAD_GAP_M.
-    extreme  : last resort, outermost road pixel of every row on the requested side of the vehicle.
+    Collect boundary pixels on one side of the vehicle to estimate the road edge under strict,
+    tolerant, or extreme fallback behavior depending on visibility and road mask gaps.
     """
     h, w = road.shape
     c = w // 2
@@ -159,7 +160,7 @@ def road_edge_points(road, safe, direction, mode="strict"):
 
 
 def road_edge_candidate(road, safe, direction):
-    """Strict -> tolerant -> extreme: the first mode that yields a valid line wins."""
+    """Fit a road-edge line from boundary points using a progressive fallback strategy: strict, tolerant, then extreme."""
     for mode in ("strict", "tolerant", "extreme"):
         p = road_edge_points(road, safe, direction, mode=mode)
         if len(p) < ROAD_EDGE_MIN_INLIERS:
@@ -178,9 +179,7 @@ def road_edge_candidate(road, safe, direction):
 
 def road_edges(road, safe):
     """
-    Left and right road edges. If their slopes differ by more than EDGE_PARALLEL_TOL, the longer one
-    is trusted and the other is rebuilt with the same slope, through the outermost point of the
-    road-mask boundary on its side.
+    Estimate the left and right road edges, and if one edge is ambiguous, rebuild it with the stronger edge's slope.
     """
     edge_l = road_edge_candidate(road, safe, -1)
     edge_r = road_edge_candidate(road, safe, +1)
@@ -205,6 +204,7 @@ def road_edges(road, safe):
 
 # ---------------- RANSAC (one line) ----------------
 def n_iteration(p, w, n_points=2):
+    """Estimate the number of RANSAC iterations needed to reach the target confidence for a given inlier ratio."""
     w_n = w ** n_points
     if w_n >= 1.0:
         return 1
@@ -214,10 +214,12 @@ def n_iteration(p, w, n_points=2):
 
 
 def line_distance(points, a, b):
+    """Compute the orthogonal distance of each point to the line x = a*z + b."""
     return np.abs(points[:, 0] - (a * points[:, 1] + b)) / np.sqrt(a ** 2 + 1)
 
 
 def line_fit(p1, p2, separation=MIN_SEPARATION_M, max_slope=MAX_SLOPE, a_ref=0.0):
+    """Fit a candidate line from two points while enforcing a minimum z span and slope bounds."""
     (x1, z1), (x2, z2) = p1, p2
     dz = z2 - z1
     if abs(dz) < separation:
@@ -229,13 +231,13 @@ def line_fit(p1, p2, separation=MIN_SEPARATION_M, max_slope=MAX_SLOPE, a_ref=0.0
 
 
 def coverage(points, mask):
-    """Number of distinct z-bins containing at least one inlier (blobs don't count more than once per bin)."""
+    """Count how many z-bins are covered by inliers, counting each depth bin only once."""
     zb = np.clip(((points[mask, 1] - Z_RANGE[0]) / COV_BIN_M).astype(int), 0, None)
     return int(np.count_nonzero(np.bincount(zb)))
 
 
 def ridge_cov(c, grad, ref):
-    """Metres of the line (z-bins of COV_BIN_M) where the ridge response near the line exceeds RIDGE_STRONG_FRAC * ref."""
+    """Measure the length of a line that lies on a strong ridge/paint response relative to the reference image."""
     h, w = grad.shape
     z = np.arange(Z_RANGE[0] + COV_BIN_M / 2, Z_RANGE[1], COV_BIN_M)
     rows = np.clip(((Z_RANGE[1] - z) * PX_PER_M).astype(int), 0, h - 1)
@@ -253,6 +255,7 @@ def ridge_cov(c, grad, ref):
 
 def ransac(points, threshold=INLINER_TRESHOLD_M, min_inliers=MIN_INLIERS, max_iter=MAX_ITER,
             p=SUCCESS_PROBABILITY, max_slope=MAX_SLOPE, sep_min=MIN_SEPARATION_M, seed=0, a_ref=0.0):
+    """Use random sample consensus to find the best line model that explains the point cloud."""
     N = len(points)
     if N < max(2, min_inliers):
         return None
@@ -283,7 +286,7 @@ def ransac(points, threshold=INLINER_TRESHOLD_M, min_inliers=MIN_INLIERS, max_it
 
 # ---------------- candidates ----------------
 def x_at(line, z=None):
-    """Lateral position of a line at a z inside the range (not at z=0, which is extrapolated)."""
+    """Return the lateral position x of a line at a given z value in the BEV coordinate frame."""
     if z is None:
         z = 0.5 * (Z_RANGE[0] + Z_RANGE[1])
     return line["a"] * z + line["b"]
@@ -291,9 +294,8 @@ def x_at(line, z=None):
 
 def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M, a_ref=0.0):
     """
-    Sequential RANSAC over ALL points: find the best line, remove the points near it
-    (band 2*threshold, so the other edge of the same line is not picked again), and repeat.
-    The 'inliers' mask of each candidate refers to the original array.
+    Iteratively extract the strongest lane candidates by running RANSAC, then removing nearby inliers
+    so the same lane marking does not appear multiple times in the candidate list.
     """
     cands = []
     remaining = np.arange(len(points))
@@ -314,17 +316,18 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M, a_ref=
 
 
 def line_score(c):
-    """Metres covered, plus a bonus for the metres lying on a strong ridge (bright paint). Lines without paint keep their cov_m."""
+    """Score a candidate by its geometric coverage and ridge evidence so painted lane marks rank above noise."""
     return c["cov_m"] + RIDGE_BONUS * c.get("ridge_m", 0.0)
 
 
 # at the moment unused
 def _rank(c):
-    """Road edges always win a merge; among painted lines, the one with more inliers wins."""
+    """Give road edges priority and then prefer the candidate with more inliers when comparing duplicates."""
     return (1, 0) if c.get("edge") else (0, int(c["inliers"].sum()))
 
 
 def filter_parallel(cands, edges):
+    """Keep only candidate lines whose slope is close to the road edges or the dominant lane direction."""
     if not cands:
         return []
     if edges:
@@ -340,6 +343,7 @@ def filter_parallel(cands, edges):
 
 # at the moment unused
 def merge_close(lines):
+    """Merge nearby candidate lines, preferring the stronger line when two candidates represent the same boundary."""
     out = []
     for c in sorted(lines, key=x_at):
         if out:
@@ -354,6 +358,7 @@ def merge_close(lines):
 
 
 def build_lanes(cands, left_edge, right_edge):
+    """Assemble the candidate lane boundaries into left/right lane pairs that fill the road area."""
     left_edge, right_edge = snap_edge(left_edge, cands), snap_edge(right_edge, cands)
     lines = select_interior(cands, left_edge, right_edge)
     return [[l, r, x_at(l, EGO_Z_M) < 0 < x_at(r, EGO_Z_M)] for l, r in zip(lines[:-1], lines[1:])]
@@ -361,6 +366,7 @@ def build_lanes(cands, left_edge, right_edge):
 
 # ---------------- drawing ----------------
 def line_on_image(line, M_inv, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
+    """Project a fitted BEV line back onto the original image using the inverse homography."""
     a, b = line["a"], line["b"]
     z = np.linspace(z_range[0], z_range[1], 100)
     x = a * z + b
@@ -371,7 +377,7 @@ def line_on_image(line, M_inv, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER
 
 
 def draw_lanes(img, M_inv, lanes, alpha=0.35, thickness=4):
-    """Fill each lane (ego green, others red), then draw only the lines that bound the lanes."""
+    """Fill the detected lane regions and draw the boundary lines on the input image."""
     overlay = img.copy()
     for left, right, is_ego in lanes:
         area = np.vstack((line_on_image(left, M_inv), line_on_image(right, M_inv)[::-1])).astype(np.int32)
@@ -388,6 +394,7 @@ def draw_lanes(img, M_inv, lanes, alpha=0.35, thickness=4):
 
 # ---------------- main function ----------------
 def lane_fitting(pipe, img):
+    """Run the full lane-detection pipeline to estimate road boundaries, candidate lane markings, and final lanes."""
     safe = cv2.erode(pipe["valid"].astype(np.uint8), np.ones((17, 17), np.uint8)) > 0
     edge_l, edge_r = road_edges(pipe["road"], safe)
     raw_edges = [e for e in (edge_l, edge_r) if e]
@@ -414,6 +421,7 @@ def lane_fitting(pipe, img):
 
 
 def plot_bev_debug(img_thresh, fitting_out, out_path):
+    """Save a BEV debug plot showing the road, candidates, and final fitted lane lines."""
     fig, ax = plt.subplots(figsize=(7, 8))
     ax.imshow(img_thresh, cmap="gray", origin="upper", extent=(X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1]), aspect="auto")
     ax.axvline(0, color="yellow", linestyle="--", linewidth=1, label="vehicle centre")
@@ -445,6 +453,7 @@ def plot_bev_debug(img_thresh, fitting_out, out_path):
 
 
 def save_candidates(img, img_thresh, pts, cands, M_inv, out_bev, out_img):
+    """Export a visualization of all candidate lane lines in BEV and in the original camera image."""
     z = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
 
     # 1) bird-eye view with all candidates
