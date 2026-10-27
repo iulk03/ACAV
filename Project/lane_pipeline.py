@@ -7,7 +7,7 @@ import lane_fitting as lf
 import net_classifier as nc
 
 X_RANGE = (-7.0, 7.0)       # road width in metres
-Z_RANGE = (7.0, 20.0)       # road depth in metres
+Z_RANGE = (6.5, 20.0)       # road depth in metres
 PX_PER_M = 30               # bird-eye view resolution (1 px = 1/30 m)
 GAUSS_KSIZE = 5             # gaussian kernel size (noise reduction)
 PERCENTILE = 97             # keep the strongest 3% gradient pixels (per block)
@@ -33,25 +33,35 @@ def read_calib(path):
     return calib
 
 
-def compute_trapezoid(calib, x_range=X_RANGE, z_range=Z_RANGE):
-    """Project the road rectangle (x, z) onto the image: returns the 4 trapezoid corners in pixels."""
+def project_to_image(calib, x, z):
+    """Project the road point (x, 0, z) onto the image: returns (u, v) in pixels."""
     P2 = calib["P2"].reshape(3, 4)
     R0_rect = calib["R0_rect"].reshape(3, 3)
     T = calib["Tr_cam_to_road"].reshape(3, 4)
     R, t = T[:, :3], T[:, 3]
+    p_cam = R.T @ (np.array([x, 0.0, z]) - t)
+    u, v, w = P2 @ np.append(R0_rect @ p_cam, 1.0)
+    return [u / w, v / w]
 
-    def project(x, z):
-        p_road = np.array([x, 0.0, z])
-        p_cam = R.T @ (p_road - t)
-        p_cam_rect = R0_rect @ p_cam
-        u, v, w = P2 @ np.append(p_cam_rect, 1.0)
-        return [u / w, v / w]
 
+def z_at_image_bottom(calib, img_h, x=0.0, z_lo=1.0, z_hi=20.0):
+    """Road depth z [m] whose ground point projects onto the last image row (bisection, v decreases with z)."""
+    for _ in range(40):
+        mid = 0.5 * (z_lo + z_hi)
+        if project_to_image(calib, x, mid)[1] > img_h - 1:   # still below the image -> go farther
+            z_lo = mid
+        else:
+            z_hi = mid
+    return 0.5 * (z_lo + z_hi)
+
+
+def compute_trapezoid(calib, x_range=X_RANGE, z_range=Z_RANGE):
+    """Project the road rectangle (x, z) onto the image: returns the 4 trapezoid corners in pixels."""
     return np.float32([
-        project(x_range[0], z_range[0]),
-        project(x_range[1], z_range[0]),
-        project(x_range[1], z_range[1]),
-        project(x_range[0], z_range[1]),
+        project_to_image(calib, x_range[0], z_range[0]),
+        project_to_image(calib, x_range[1], z_range[0]),
+        project_to_image(calib, x_range[1], z_range[1]),
+        project_to_image(calib, x_range[0], z_range[1]),
     ])
 
 
@@ -153,6 +163,7 @@ def lane_pipeline(calib_path, img, out_path=None):
 
     # 1) classifier branch: road mask, road contour, colour edges
     road_u8 = nc.road_mask_bev(bev, valid)              # uint8 0/255
+    ego_prob = nc.ego_prob_bev(bev, valid)
     road_ok = (road_u8 > 0).mean() > MIN_ROAD_FRAC
     edge_l = edge_r = None                              # defined in both branches
     if road_ok:
@@ -192,7 +203,7 @@ def lane_pipeline(calib_path, img, out_path=None):
             ("Final threshold", thresh, "gray"),
         ], out_path)
 
-    return dict(M=M, M_inv=M_inv, thresh=thresh, road_edge=road_edge, road=road, valid=valid, gray=gray, grad=grad, grad_thr=grad_thr)
+    return dict(M=M, M_inv=M_inv, thresh=thresh, road_edge=road_edge, road=road, valid=valid, gray=gray, grad=grad, grad_thr=grad_thr, ego_prob=ego_prob)
 
 
 def save_panels(panels, out_path, ncols=3):
