@@ -21,6 +21,8 @@ LINE_MIN_LEN_PX = 21    # ~0.7 m: anything shorter vertically is not a marking
 MIN_WEDGE_M = 2.5       # sanity bounds on the road width
 MAX_WEDGE_M = 12.0
 
+USE_OLD_SOBEL = True        # prova: unisce al segnale ridge anche il vecchio Sobel
+
 
 # ---------------- calibration and geometry ----------------
 def read_calib(path):
@@ -184,9 +186,17 @@ def lane_pipeline(calib_path, img, out_path=None):
     a_ref = float(np.mean([e["a"] for e in edges])) if edges else 0.0
     grad = line_ridge(gray, valid, a=a_ref).astype(np.float64)
 
-    grad_thr = threshold(grad, region)
+    #prova per sobel
+    grad_thr = threshold(grad, region)                   # solo ridge: serve al punteggio "paint"
+    grad_thr_all = grad_thr
+    if USE_OLD_SOBEL:
+        sobel = gradient_filter(gray)
+        sobel_thr = threshold(sobel, region)
+        grad_thr_all = cv2.bitwise_or(grad_thr, sobel_thr)
+
     chroma = nc.chroma_edges(bev, valid)
-    thresh = cv2.bitwise_or(grad_thr, chroma)
+    thresh = cv2.bitwise_or(grad_thr_all, chroma)
+    #fin e prova sobel
 
     if out_path is not None:
         vis = img.copy()

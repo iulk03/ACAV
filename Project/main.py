@@ -5,18 +5,22 @@ import lane_fitting as lf
 import lane_pipeline as lp
 import vehicle_detector as vd
 
+
 BASE_DIR = Path(__file__).resolve().parent
 ROOT = BASE_DIR / "data_road"
 OUT_DIR = BASE_DIR / "debug_images"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 OPTIONS = {'um':94, 'umm':95, 'uu':97}
 
+for file_path in OUT_DIR.iterdir():
+        if file_path.is_file():
+            file_path.unlink()
 # set this variable to a number to process one image, None to process all the images for a specific type, w to process only wrongly detected images
 SINGLE = 'w'
 TYPE = 0 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 
-wrong = [11, 28, 30, 33, 34, 40, 45, 61, 62, 64, 65, 76]
+wrong = [10, 11, 12, 28, 29, 30, 33, 34, 38, 40, 45, 47, 61, 62, 64, 65, 76, 93]
 
 def execute(img_idx, img_type):
     type = sorted(glob.glob(f"{ROOT}/training/image_2/{img_type}_*.png"))

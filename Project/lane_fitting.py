@@ -98,17 +98,17 @@ def draw_lead(img, M_inv, lead, left, right):
 
 
 def snap_edge(edge, cands):
-    """Replace a road edge with the strongest nearby painted lane candidate if it matches that edge well."""
     if edge is None:
         return None
     span = Z_RANGE[1] - Z_RANGE[0]
+    def d(c): return abs(x_at(c, EGO_CHECK_Z_M) - x_at(edge, EGO_CHECK_Z_M))
     near = [c for c in cands
-        if abs(x_at(c) - x_at(edge)) <= SNAP_MAX_DIST_M
-        and c["cov_m"] >= SNAP_MIN_COV_FRAC * span
-        and (c["paint"] >= PAINT_MIN_FRAC or c["ridge_m"] >= SNAP_MIN_RIDGE_FRAC * span)]
+            if d(c) <= SNAP_MAX_DIST_M
+            and c["ridge_m"] >= SNAP_MIN_RIDGE_FRAC * span   # evidenza di vernice
+            and c["paint"] >= PAINT_MIN_FRAC]
     if not near:
         return edge
-    best = max(near, key=line_score)
+    best = max(near, key=lambda c: (c["ridge_m"], -d(c)))    # vernice, poi vicinanza
     return dict(best, edge=True, n_inl=int(best["inliers"].sum()), snapped=True)
 
 
