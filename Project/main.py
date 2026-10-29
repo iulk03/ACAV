@@ -1,37 +1,61 @@
-import matplotlib.pyplot as plt
-import cv2 
 import glob
 from pathlib import Path
-import lane_pipeline as lp
+import cv2
 import lane_fitting as lf
+import lane_pipeline as lp
+import vehicle_detector as vd
 
-BASE_DIR = Path(__file__).resolve().parent   
+
+BASE_DIR = Path(__file__).resolve().parent
 ROOT = BASE_DIR / "data_road"
-um = sorted(glob.glob(f"{ROOT}/training/image_2/um_*.png"))
-umm = sorted(glob.glob(f"{ROOT}/training/image_2/umm_*.png"))
-uu = sorted(glob.glob(f"{ROOT}/training/image_2/uu_*.png"))
+OUT_DIR = BASE_DIR / "debug_images"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+OPTIONS = {'um':94, 'umm':95, 'uu':97}
 
-IMAGE_INDEX = 8
-image_path = Path(um[IMAGE_INDEX])
-img = cv2.imread(str(image_path))   
-img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+for file_path in OUT_DIR.iterdir():
+        if file_path.is_file():
+            file_path.unlink()
+# set this variable to a number to process one image, None to process all the images for a specific type, w to process only wrongly detected images
+SINGLE = 'w'
+TYPE = 0 # 0 = um, 1 = umm, 2 = uu
+ALL = False # True to process all the images (um, umm, uu)
 
-calib_path = ROOT / "training" / "calib" / f"{image_path.stem}.txt"
-M_inv, img_thresh = lp.lane_pipeline(calib_path, img)
+wrong = [61]
 
-out = lf.lane_fitting(img_thresh, img, M_inv)
-lf.plot_bev_debug(img_thresh, out)
+def execute(img_idx, img_type):
+    type = sorted(glob.glob(f"{ROOT}/training/image_2/{img_type}_*.png"))
+    image_path = Path(type[img_idx])
+    stem = image_path.stem
+    img = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
+    calib_path = ROOT / "training" / "calib" / f"{stem}.txt"
 
-if "overlay" in out:
-    plt.figure(figsize=(12, 4))
-    plt.imshow(out["overlay"])
-    plt.axis("off")
-    plt.show()
+    pipe = lp.lane_pipeline(calib_path, img, out_path=OUT_DIR / f"{stem}_bev.png")
+
+    vehicles = lf.vehicles_to_road(vd.detect_vehicles(img), pipe["M"])
+    out = lf.lane_fitting(pipe, img, vehicles)
+    lf.print_candidate_stats(out)
+
+    lf.plot_bev_debug(pipe["thresh"], out, OUT_DIR / f"{stem}_candidates.png")
+    lf.save_candidates(img, pipe["thresh"], out["pts"], out["candidates"] + out["edges"], pipe["M_inv"], OUT_DIR / f"00_{stem}_cands_bev.png", OUT_DIR / f"{stem}_cands_img.png")
+
+    if "overlay" in out:
+        cv2.imwrite(str(OUT_DIR / f"{stem}_overlay.png"), cv2.cvtColor(out["overlay"], cv2.COLOR_RGB2BGR))
+        print(f"img: {img_idx}, lanes: {len(out['lanes'])} (ego found: {out['ransac_sx'] is not None})")
+    else:
+        print(f"No lane found. Points: {len(out['pts'])}; painted candidates: {len(out['candidates'])}; "f"road edges: {len(out['edges'])}")
+
+
+if ALL:
+    for type, max_img_idx in list(OPTIONS.items()):
+        for idx in range(max_img_idx):
+            execute(idx, type)
 else:
-    print(
-        "RANSAC non ha trovato entrambe le linee. "
-        f"Punti a sinistra: {len(out['pts_sx'])}; "
-        f"punti a destra: {len(out['pts_dx'])}; "
-        f"linea sinistra trovata: {out['ransac_sx'] is not None}; "
-        f"linea destra trovata: {out['ransac_dx'] is not None}"
-    )
+    type, max_img_idx = list(OPTIONS.items())[TYPE] # depending which type of raod we want to check
+    if SINGLE is None:
+        for idx in range(max_img_idx):
+            execute(idx, type)
+    elif SINGLE == 'w':
+        for idx in wrong:
+            execute(idx, type)
+    else:
+        execute(SINGLE, type)

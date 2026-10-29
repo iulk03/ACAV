@@ -1,40 +1,267 @@
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
 from lane_pipeline import X_RANGE, Z_RANGE, PX_PER_M
 
-# ---------------- parametri RANSAC ----------------
-MARGIN_PX = 6               # esclude i pixel troppo vicini ai bordi
-INLINER_TRESHOLD_M = 0.20   # distanza massima per essere inlier
-MIN_SEPARATION_M = 4.0      # distanza minima in z tra i due punti che definiscono una retta
+# ---------------- RANSAC parameters ----------------
+MARGIN_PX = 6               # ignore pixels too close to the image border
+INLINER_TRESHOLD_M = 0.2    # max distance to be an inlier
+MIN_SEPARATION_M = 2.0      # min z distance between the two points defining a line
 SUCCESS_PROBABILITY = 0.99
 MAX_ITER = 500
-MIN_INLIERS = 50
-MAX_SLOPE = 0.5             # pendenza massima di una singola retta (x = a*z + b)
+MIN_INLIERS = 100
+MAX_SLOPE = 0.4            # max slope of a single line (x = a*z + b)
+SLOPE_TOL = 0.06            # painted lines: |a - a_ref| <= SLOPE_TOL, a_ref from the road edges
+COV_BIN_M = 0.1             # z-bin used to measure how much of the line is actually covered
+BOTTOM_MARGIN_PX = 1        # near edge: keep almost every row (MARGIN_PX still applies to top/left/right)
 
-# ---------------- parametri di scelta della coppia ----------------
-N_CANDIDATES = 5            # quante rette candidate cercare (ogni linea bianca ha 2 bordi)
-Z_REF = 0.5 * (Z_RANGE[0] + Z_RANGE[1])   # z a cui si misura la posizione laterale (dentro il range)
-LANE_W_MIN = 2.5            # larghezza minima plausibile della corsia (m)
-LANE_W_MAX = 4.5            # larghezza massima plausibile (m)
-SLOPE_DELTA_MAX = 0.1       # differenza massima di pendenza tra le due rette
-W_CENTER = 100.0            # peso della penalita' "auto lontana dal centro della coppia" (in pixel/metro)
-LANE_WIDTH_M = 3.2          # larghezza di default per il ripiego (un solo lato trovato)
+# ---------------- candidate and lane parameters ----------------
+SNAP_MAX_DIST_M = 1.0           # a painted line replaces the mask edge only if it is this close to it
+SNAP_MIN_COV_FRAC = 0.5         # ... and covers at least this fraction of the BEV depth
+INTERIOR_MIN_SCORE_FRAC = 0.4   # interior line score vs the best interior line
+EDGE_BAND_M = 0.3               # RANSAC points are searched between the edges, widened by this band
+NARROW_MIN_COV_FRAC = 0.4       # a line closer than MIN_LANE_WIDTH_M to a road edge must cover at least this fraction of the BEV depth
+
+N_CANDIDATES = 10               # how many candidate lines to search for
+SLOPE_DELTA_MAX = 0.4           # max slope difference to be considered parallel
+MERGE_DIST_M = 2.0              # painted line vs road edge: closer than this = duplicate of the edge marking
+MIN_LANE_WIDTH_M = 2.5          # painted vs painted: no real lane is narrower than this
+ROAD_EDGE_THRESHOLD_M = 0.25
+ROAD_EDGE_MIN_INLIERS = 40
+ROAD_GAP_M = 3.5                # max non-road gap between the vehicle column and the first road run (shadow holes)
+EDGE_PARALLEL_TOL = 0.12
+EGO_Z_M = 0.0
+EGO_CHECK_Z_M = Z_RANGE[0]      # depth at which the ego lane is decided (no extrapolation outside the BEV)
+PAINT_MIN_FRAC = 0.3            # start at 0.0 (filter off): first measure, then set it
+SNAP_MIN_RIDGE_FRAC = 0.4       # snap: ridge coverage (fraction of BEV depth) accepted as paint evidence
+EGO_AXIS_TOL_M = 0.8            # a lane is an ego candidate if the vehicle axis falls inside it, widened by this tolerance
+
+RIDGE_REF_PCT = 99.9            # reference ridge strength: this percentile of the ridge image
+RIDGE_STRONG_FRAC = 0.3         # a z-bin counts as "on paint" if the ridge near the line exceeds this fraction of the reference
+RIDGE_HALF_W_M = 0.15           # half-width of the window around the line where the ridge is searched
+RIDGE_BONUS = 2.0               # score bonus per metre of line lying on a strong ridge
+
+# ---------------- curvature and prediction (ego lane) ----------------
+MIN_POLY_POINTS = 60            # min support points to fit a quadratic on a boundary
+MIN_POLY_SPAN_FRAC = 0.5        # support points must span at least this fraction of the BEV depth
+MAX_CURVATURE = 0.05            # 1/m: |kappa| above this (R < 20 m) is treated as a bad fit -> straight line
+LOOKAHEAD_M = 10.0              # distance from the vehicle (z = EGO_Z_M) of the red target point
+D_MIN_M = 5.0                   # minimum gap to the lead vehicle
+T_GAP_S = 1.5                   # time gap for v_max
+FOOT_SHRINK = 0.6               # use only the central 60% of the bbox width for the lane-overlap test
+
+CAND_COLORS = ["red", "cyan", "lime", "magenta", "orange", "dodgerblue", "gold", "deeppink", "white", "mediumpurple"]
+EGO_FILL = (0, 255, 0)          # RGB: ego lane
+OTHER_FILL = (255, 0, 0)        # RGB: every other lane
 
 
-# ---------------- da immagine binaria a coordinate strada ----------------
-def points_in_meters(img_tresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_RANGE, margin_px=MARGIN_PX):
-    height, width = img_tresh.shape
-    row, column = np.nonzero(img_tresh)
-    ok = (row >= margin_px) & (row < height - margin_px) & (column >= margin_px) & (column < width - margin_px)
+def cv2_color(name):
+    """Convert a Matplotlib color name into the RGB tuple expected by OpenCV for drawing."""
+    return tuple(int(255 * v) for v in mcolors.to_rgb(name))
+
+
+LINE_COLORS = [cv2_color("magenta"), cv2_color("yellow"), cv2_color("blue")]
+
+
+# functions to detect vehicles on the road
+def vehicles_to_road(dets, M):
+    """Project bbox ground-contact points (bottom-left/centre/right) to road coords via the BEV homography."""
+    for d in dets:
+        x1, y1, x2, y2 = d["box"]
+        xc, hw = 0.5 * (x1 + x2), 0.5 * FOOT_SHRINK * (x2 - x1)
+        px = np.float32([[xc - hw, y2], [xc, y2], [xc + hw, y2]]).reshape(-1, 1, 2)
+        bev = cv2.perspectiveTransform(px, M).reshape(-1, 2)
+        x = X_RANGE[0] + bev[:, 0] / PX_PER_M
+        z = Z_RANGE[1] - bev[:, 1] / PX_PER_M
+        d.update(x_l=float(x[0]), x_r=float(x[2]), z=float(z[1]))
+    return dets
+
+
+def lead_vehicle(vehicles, left, right):
+    """Closest vehicle whose footprint overlaps the ego lane at its own depth, or None."""
+    hits = [v for v in vehicles
+            if v["z"] > 0 and v["x_r"] > x_at(left, v["z"]) and v["x_l"] < x_at(right, v["z"])]
+    return min(hits, key=lambda v: v["z"], default=None)
+
+
+def draw_lead(img, M_inv, lead, left, right):
+    """Draw the lead bbox and the distance lines across the ego lane (in place)."""
+    if lead is None:
+        return
+    x1, y1, x2, y2 = lead["box"].astype(int)
+    cv2.rectangle(img, (x1, y1), (x2, y2), (255, 128, 0), 2)
+    for z, col in ((lead["z"], (255, 0, 0)), (lead["z"] - D_MIN_M, (255, 255, 0))):
+        zz = np.full(2, z)
+        xx = np.array([x_at(left, z), x_at(right, z)])
+        cv2.polylines(img, [bev_points_on_image(xx, zz, M_inv).astype(np.int32)], False, col, 3, cv2.LINE_AA)
+
+
+def snap_edge(edge, cands):
+    if edge is None:
+        return None
+    span = Z_RANGE[1] - Z_RANGE[0]
+    def d(c): return abs(x_at(c, EGO_CHECK_Z_M) - x_at(edge, EGO_CHECK_Z_M))
+    near = [c for c in cands
+            if d(c) <= SNAP_MAX_DIST_M
+            and c["ridge_m"] >= SNAP_MIN_RIDGE_FRAC * span   # evidenza di vernice
+            and c["paint"] >= PAINT_MIN_FRAC]
+    if not near:
+        return edge
+    best = max(near, key=lambda c: (c["ridge_m"], -d(c)))    # vernice, poi vicinanza
+    return dict(best, edge=True, n_inl=int(best["inliers"].sum()), snapped=True)
+
+
+def select_interior(cands, left_edge, right_edge):
+    """Pick the most credible interior lane marks while ignoring duplicates and weak edge-like candidates."""
+    edges = [e for e in (left_edge, right_edge) if e]
+    span = Z_RANGE[1] - Z_RANGE[0]
+    
+    def narrow_ok(c):
+        # a line squeezed between 2.0 and 2.5 m from an edge is accepted only with strong evidence
+        near_edge = any(abs(x_at(c) - x_at(e)) < MIN_LANE_WIDTH_M for e in edges)
+        return not near_edge or c["cov_m"] >= NARROW_MIN_COV_FRAC * span
+
+    pool = [c for c in filter_parallel(cands, edges) if c["paint"] >= PAINT_MIN_FRAC and narrow_ok(c)]
+    if left_edge:
+        pool = [c for c in pool if x_at(c) > x_at(left_edge) + MERGE_DIST_M]
+    if right_edge:
+        pool = [c for c in pool if x_at(c) < x_at(right_edge) - MERGE_DIST_M]
+
+    for c in cands:
+            print(f"  x@mid={x_at(c):+.2f} paint={c['paint']:.2f} cov={c['cov_m']:.1f} "
+                    f"ridge={c['ridge_m']:.1f} score={line_score(c):.1f} "
+                    f"in_pool={c in pool}")
+            
+    pool.sort(key=line_score, reverse=True)
+    keep = list(edges)
+    for c in pool:
+        if line_score(c) < INTERIOR_MIN_SCORE_FRAC * line_score(pool[0]):
+            break
+        if all(abs(x_at(c) - x_at(k)) >= (MERGE_DIST_M if k.get("edge") else MIN_LANE_WIDTH_M) for k in keep):
+            keep.append(c)
+    keep.sort(key=x_at)
+
+    # an estimated edge is only a guess: if a painted line already bounds the road on the non-ego side, drop it
+    if len(keep) >= 3:
+        if keep[0].get("estimated") and not keep[1].get("edge") and x_at(keep[1], EGO_CHECK_Z_M) < 0:
+            keep = keep[1:]
+        if len(keep) >= 3 and keep[-1].get("estimated") and not keep[-2].get("edge") and x_at(keep[-2], EGO_CHECK_Z_M) > 0:
+            keep = keep[:-1]
+    print("linee tenute:", [round(x_at(k), 2) for k in keep])
+    return keep
+
+
+def restrict_to_edges(pts_dict, edge_l, edge_r, band=EDGE_BAND_M):
+    """Keep only points lying inside the valid road band between the left and right edges."""
+    keep = np.ones(len(pts_dict["x"]), bool)
+    z = pts_dict["z"]
+    if edge_l:
+        keep &= pts_dict["x"] >= edge_l["a"] * z + edge_l["b"] - band
+    if edge_r:
+        keep &= pts_dict["x"] <= edge_r["a"] * z + edge_r["b"] + band
+    return {k: v[keep] for k, v in pts_dict.items()}
+
+
+# ---------------- binary image -> road coordinates ----------------
+def points_in_meters(img_thresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_RANGE, margin_px=MARGIN_PX, bottom_margin_px=BOTTOM_MARGIN_PX):
+    """Convert a thresholded bird's-eye-view mask into meter-based x/z coordinates for lane fitting."""
+    height, width = img_thresh.shape
+    row, column = np.nonzero(img_thresh)
+    ok = ((row >= margin_px) & (row < height - bottom_margin_px) & (column >= margin_px) & (column < width - margin_px))
     row, column = row[ok], column[ok]
     x = x_range[0] + column / px_per_m
     z = z_range[1] - row / px_per_m
-    return dict(x=x, z=z)
+    return dict(x=x, z=z, row=row, column=column)
 
 
-# ---------------- RANSAC (una retta) ----------------
+def road_edge_points(road, safe, direction, mode="strict"):
+    """
+    Collect boundary pixels on one side of the vehicle to estimate the road edge under strict,
+    tolerant, or extreme fallback behavior depending on visibility and road mask gaps.
+    """
+    h, w = road.shape
+    c = w // 2
+    max_gap = int(ROAD_GAP_M * PX_PER_M)
+    xs, zs = [], []
+    for r in range(h):
+        if mode == "extreme":
+            cols = np.flatnonzero(road[r])
+            if len(cols) == 0:
+                continue
+            col = cols[-1] + 1 if direction > 0 else cols[0] - 1
+            if not (0 <= col < w) or direction * (col - c) <= 0 or not safe[r, col]:
+                continue
+        else:
+            seg = road[r, c:] if direction > 0 else road[r, :c + 1][::-1]
+            if seg[0]:
+                start = 0
+            elif mode == "tolerant":
+                hits = np.flatnonzero(seg)
+                if len(hits) == 0 or hits[0] > max_gap:
+                    continue
+                start = hits[0]
+            else:
+                continue
+            end = np.flatnonzero(~seg[start:])
+            if len(end) == 0:
+                continue
+            k = start + end[0]
+            col = c + k if direction > 0 else c - k
+            if not safe[r, col]:
+                continue
+        xs.append(X_RANGE[0] + col / PX_PER_M)
+        zs.append(Z_RANGE[1] - r / PX_PER_M)
+    return np.column_stack((xs, zs)) if xs else np.empty((0, 2))
+
+
+def road_edge_candidate(road, safe, direction):
+    """Fit a road-edge line from boundary points using a progressive fallback strategy: strict, tolerant, then extreme."""
+    for mode in ("strict", "tolerant", "extreme"):
+        p = road_edge_points(road, safe, direction, mode=mode)
+        if len(p) < ROAD_EDGE_MIN_INLIERS:
+            continue
+        r = ransac(p, threshold=ROAD_EDGE_THRESHOLD_M, min_inliers=ROAD_EDGE_MIN_INLIERS)
+        if r is None:
+            continue
+        r["length"] = coverage(p, r["inliers"]) * COV_BIN_M    # straight length (m) covered by the inliers
+        r["n_inl"] = int(r["inliers"].sum())
+        r["pts"] = p[r["inliers"]]             # support points, needed for the quadratic fit
+        r["inliers"] = None
+        r["edge"] = True
+        r["mode"] = mode                   # for debugging
+        return r
+    return None
+
+
+def road_edges(road, safe):
+    """
+    Estimate the left and right road edges, and if one edge is ambiguous, rebuild it with the stronger edge's slope.
+    """
+    edge_l = road_edge_candidate(road, safe, -1)
+    edge_r = road_edge_candidate(road, safe, +1)
+    if edge_l is None or edge_r is None or abs(edge_l["a"] - edge_r["a"]) <= EDGE_PARALLEL_TOL:
+        return edge_l, edge_r
+
+    left_is_strong = (edge_l["length"], edge_l["n_inl"]) >= (edge_r["length"], edge_r["n_inl"])
+    strong, weak, side = (edge_l, edge_r, +1) if left_is_strong else (edge_r, edge_l, -1)
+
+    p = road_edge_points(road, safe, side, mode=weak["mode"])    # boundary points of the weak side
+    if len(p) == 0:
+        return edge_l, edge_r
+    x_out, z_out = p[np.argmax(side * p[:, 0])]                  # outermost point (max x right, min x left)
+    a = strong["a"]
+    fixed = dict(weak, a=a, b=float(x_out - a * z_out), estimated=True)
+
+    z = np.array(Z_RANGE)                                        # the rebuilt edge must stay on its own side
+    if np.any(side * ((fixed["a"] * z + fixed["b"]) - (strong["a"] * z + strong["b"])) <= 0):
+        return edge_l, edge_r
+    return (edge_l, fixed) if left_is_strong else (fixed, edge_r)
+
+
+# ---------------- RANSAC (one line) ----------------
 def n_iteration(p, w, n_points=2):
+    """Estimate the number of RANSAC iterations needed to reach the target confidence for a given inlier ratio."""
     w_n = w ** n_points
     if w_n >= 1.0:
         return 1
@@ -44,62 +271,88 @@ def n_iteration(p, w, n_points=2):
 
 
 def line_distance(points, a, b):
+    """Compute the orthogonal distance of each point to the line x = a*z + b."""
     return np.abs(points[:, 0] - (a * points[:, 1] + b)) / np.sqrt(a ** 2 + 1)
 
 
-def line_fit(p1, p2, separation=MIN_SEPARATION_M, max_slope=MAX_SLOPE):
+def line_fit(p1, p2, separation=MIN_SEPARATION_M, max_slope=MAX_SLOPE, a_ref=0.0):
+    """Fit a candidate line from two points while enforcing a minimum z span and slope bounds."""
     (x1, z1), (x2, z2) = p1, p2
     dz = z2 - z1
     if abs(dz) < separation:
         return None
     a = (x2 - x1) / dz
-    if abs(a) > max_slope:
+    if abs(a - a_ref) > max_slope:
         return None
     return a, x1 - a * z1
 
 
+def coverage(points, mask):
+    """Count how many z-bins are covered by inliers, counting each depth bin only once."""
+    zb = np.clip(((points[mask, 1] - Z_RANGE[0]) / COV_BIN_M).astype(int), 0, None)
+    return int(np.count_nonzero(np.bincount(zb)))
+
+
+def ridge_cov(c, grad, ref):
+    """Measure the length of a line that lies on a strong ridge/paint response relative to the reference image."""
+    h, w = grad.shape
+    z = np.arange(Z_RANGE[0] + COV_BIN_M / 2, Z_RANGE[1], COV_BIN_M)
+    rows = np.clip(((Z_RANGE[1] - z) * PX_PER_M).astype(int), 0, h - 1)
+    cols = (c["a"] * z + c["b"] - X_RANGE[0]) * PX_PER_M
+    half = int(round(RIDGE_HALF_W_M * PX_PER_M))
+    hit = 0
+    for r, col in zip(rows, cols):
+        c0, c1 = int(col) - half, int(col) + half + 1
+        if c1 <= 0 or c0 >= w:
+            continue
+        if grad[r, max(c0, 0):c1].max() > RIDGE_STRONG_FRAC * ref:
+            hit += 1
+    return hit * COV_BIN_M
+
+
 def ransac(points, threshold=INLINER_TRESHOLD_M, min_inliers=MIN_INLIERS, max_iter=MAX_ITER,
-           p=SUCCESS_PROBABILITY, max_slope=MAX_SLOPE, sep_min=MIN_SEPARATION_M, seed=0):
+            p=SUCCESS_PROBABILITY, max_slope=MAX_SLOPE, sep_min=MIN_SEPARATION_M, seed=0, a_ref=0.0):
+    """Use random sample consensus to find the best line model that explains the point cloud."""
     N = len(points)
     if N < max(2, min_inliers):
         return None
     rng = np.random.default_rng(seed)
-    best, n_best, best_mask = None, 0, None
+    best, n_best, cov_best, best_mask = None, 0, 0, None
     k, n_iter, attempts = max_iter, 0, 0
     while n_iter < min(k, max_iter) and attempts < 50 * max_iter:
         attempts += 1
         i, j = rng.integers(0, N, size=2)
-        line = line_fit(points[i], points[j], separation=sep_min, max_slope=max_slope)
+        line = line_fit(points[i], points[j], separation=sep_min, max_slope=max_slope, a_ref=a_ref)
         if line is not None:
             a, b = line
             n_iter += 1
             inliers = line_distance(points, a, b) <= threshold
-            n_inliers = int(inliers.sum())
-            if n_inliers > n_best:
-                best, n_best, best_mask = (a, b), n_inliers, inliers
+            cov = coverage(points, inliers)
+            if cov > cov_best:
+                best, n_best, cov_best, best_mask = (a, b), int(inliers.sum()), cov, inliers
                 k = n_iteration(p, n_best / N)
     if best is None or n_best < min_inliers:
         return None
     a, b = np.polyfit(points[best_mask, 1], points[best_mask, 0], 1)
-    if abs(a) > max_slope:
-        return None
+    if abs(a - a_ref) > max_slope:
+        a, b = best                       # refit drifted out of the slope gate: keep the hypothesis that passed it
     best_mask = line_distance(points, a, b) <= threshold
     if int(best_mask.sum()) < min_inliers:
         return None
     return dict(a=float(a), b=float(b), inliers=best_mask, n_iter=n_iter)
 
-
-# ---------------- candidati multipli e scelta della coppia ----------------
-def x_at(line, z=Z_REF):
-    """Posizione laterale della retta a una z dentro il range (non a z = 0, che e' estrapolata)."""
+# ---------------- candidates ----------------
+def x_at(line, z=None):
+    """Return the lateral position x of a line at a given z value in the BEV coordinate frame."""
+    if z is None:
+        z = 0.5 * (Z_RANGE[0] + Z_RANGE[1])
     return line["a"] * z + line["b"]
 
 
-def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
+def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M, a_ref=0.0):
     """
-    RANSAC sequenziale su TUTTI i punti: trova la retta migliore, rimuove i punti vicini
-    (banda 2*threshold, cosi' non ripesca l'altro bordo della stessa linea), e ripete.
-    La maschera 'inliers' di ogni candidato e' riferita all'array originale.
+    Iteratively extract the strongest lane candidates by running RANSAC, then removing nearby inliers
+    so the same lane marking does not appear multiple times in the candidate list.
     """
     cands = []
     remaining = np.arange(len(points))
@@ -107,7 +360,7 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
         if len(remaining) < MIN_INLIERS:
             break
         sub = points[remaining]
-        r = ransac(sub)
+        r = ransac(sub, max_slope=SLOPE_TOL, a_ref=a_ref)
         if r is None:
             break
         full_mask = np.zeros(len(points), dtype=bool)
@@ -119,132 +372,273 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
     return cands
 
 
-def pair_score(l, r):
-    """Punteggio di una coppia (sinistra, destra). -inf se non e' una corsia plausibile."""
-    larg = x_at(r) - x_at(l)
-    if not (LANE_W_MIN < larg < LANE_W_MAX):
-        return -np.inf
-    if abs(l["a"] - r["a"]) > SLOPE_DELTA_MAX:
-        return -np.inf
-    centro = 0.5 * (x_at(l) + x_at(r))
-    penalita = W_CENTER * abs(centro)   # morbida: un cambio corsia puo' ancora vincere
-    return int(l["inliers"].sum()) + int(r["inliers"].sum()) - penalita
+def line_score(c):
+    """Score a candidate by its geometric coverage and ridge evidence so painted lane marks rank above noise."""
+    return c["cov_m"] + RIDGE_BONUS * c.get("ridge_m", 0.0)
 
 
-def best_pair(cands):
-    best, best_s = None, -np.inf
-    for l in cands:
-        for r in cands:
-            if l is r or x_at(l) >= x_at(r):
+# at the moment unused
+def _rank(c):
+    """Give road edges priority and then prefer the candidate with more inliers when comparing duplicates."""
+    return (1, 0) if c.get("edge") else (0, int(c["inliers"].sum()))
+
+
+def filter_parallel(cands, edges):
+    """Keep only candidate lines whose slope is close to the road edges or the dominant lane direction."""
+    if not cands:
+        return []
+    if edges:
+        a_ref = float(np.mean([e["a"] for e in edges]))          # road edges give the direction
+    else:
+        a = np.array([c["a"] for c in cands])
+        w = np.array([c["inliers"].sum() for c in cands], float)
+        o = np.argsort(a)
+        cw = np.cumsum(w[o])
+        a_ref = a[o][np.searchsorted(cw, cw[-1] / 2)]           # weighted median
+    return [c for c in cands if abs(c["a"] - a_ref) < SLOPE_DELTA_MAX]
+
+
+# at the moment unused
+def merge_close(lines):
+    """Merge nearby candidate lines, preferring the stronger line when two candidates represent the same boundary."""
+    out = []
+    for c in sorted(lines, key=x_at):
+        if out:
+            gap = x_at(c) - x_at(out[-1])
+            both_painted = not c.get("edge") and not out[-1].get("edge")
+            if gap < (MIN_LANE_WIDTH_M if both_painted else MERGE_DIST_M):
+                if _rank(c) > _rank(out[-1]):
+                    out[-1] = c
                 continue
-            s = pair_score(l, r)
-            if s > best_s:
-                best, best_s = (l, r), s
-    return best
+        out.append(c)
+    return out
 
 
-def missing_side(line, width=LANE_WIDTH_M):
-    """
-    Ripiego: una sola retta affidabile. Se sta a destra del centro e' il bordo destro,
-    altrimenti il sinistro. L'altro lato e' STIMATO (stessa pendenza, spostato di 'width').
-    """
-    est = dict(a=line["a"], b=None, inliers=None, n_iter=0, stimata=True)
-    if x_at(line) > 0:
-        est["b"] = line["b"] - width
-        return est, line          # (sinistra stimata, destra misurata)
-    est["b"] = line["b"] + width
-    return line, est              # (sinistra misurata, destra stimata)
+def lane_ego_score(left, right, ego_prob):
+    """Soft IoU between the strip left..right (BEV) and the network ego-lane probability."""
+    h, w = ego_prob.shape
+    z = Z_RANGE[1] - (np.arange(h) + 0.5) / PX_PER_M
+    c_l = ((x_at(left, z) - X_RANGE[0]) * PX_PER_M)[:, None]
+    c_r = ((x_at(right, z) - X_RANGE[0]) * PX_PER_M)[:, None]
+    cols = np.arange(w)[None, :]
+    strip = (cols >= c_l) & (cols <= c_r)
+    inter = float(ego_prob[strip].sum())
+    return inter / max(strip.sum() + ego_prob.sum() - inter, 1.0)
 
 
-# ---------------- disegno ----------------
-def line_on_image(line, M_inv, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
-    a, b = line["a"], line["b"]
-    z = np.linspace(z_range[0], z_range[1], 100)
-    x = a * z + b
-    col = (x - x_range[0]) * px_per_m
-    row = (z_range[1] - z) * px_per_m
+def build_lanes(cands, left_edge, right_edge, ego_prob=None):
+    """Assemble the lane boundaries into lanes and keep only the ego lane."""
+    left_edge, right_edge = snap_edge(left_edge, cands), snap_edge(right_edge, cands)
+    lines = select_interior(cands, left_edge, right_edge)
+    lanes = [[l, r, False] for l, r in zip(lines[:-1], lines[1:])]
+    zc = EGO_CHECK_Z_M
+    idx = [i for i, (l, r, _) in enumerate(lanes) if x_at(l, zc) - EGO_AXIS_TOL_M < 0 < x_at(r, zc) + EGO_AXIS_TOL_M]
+    if not idx:
+        return []
+    if len(idx) > 1:                      # the car straddles a line: let the network decide
+        if ego_prob is not None:
+            best = max(idx, key=lambda i: lane_ego_score(lanes[i][0], lanes[i][1], ego_prob))
+        else:
+            best = idx[-1]                # fallback: right-hand traffic -> rightmost lane
+    else:
+        best = idx[0]
+    lanes[best][2] = True
+    return [lanes[best]]
+
+
+# ---------------- drawing ----------------
+def bev_points_on_image(x, z, M_inv, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
+    """Project BEV road coordinates (x, z in metres) onto the original image using the inverse homography."""
+    col = (np.asarray(x) - x_range[0]) * px_per_m
+    row = (z_range[1] - np.asarray(z)) * px_per_m
     points_px = np.column_stack((col, row)).astype(np.float32).reshape(-1, 1, 2)
     return cv2.perspectiveTransform(points_px, M_inv).reshape(-1, 2)
 
 
-def draw_line(img, M_inv, line_lft, line_rgt, alpha=0.35):
-    lf = line_on_image(line_lft, M_inv)
-    rg = line_on_image(line_rgt, M_inv)
-    area = np.vstack((lf, rg[::-1])).astype(np.int32)
+def line_on_image(line, M_inv, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
+    """Project a fitted BEV line (x = c*z^2 + a*z + b, c optional) back onto the original image."""
+    z = np.linspace(z_range[0], z_range[1], 100)
+    x = line.get("c", 0.0) * z ** 2 + line["a"] * z + line["b"]
+    return bev_points_on_image(x, z, M_inv, x_range, z_range, px_per_m)
+
+
+def draw_lanes(img, M_inv, lanes, alpha=0.35, thickness=4):
+    """Fill the detected lane regions and draw the boundary lines on the input image."""
     overlay = img.copy()
-    cv2.fillPoly(overlay, [area], (0, 255, 0))
+    for left, right, is_ego in lanes:
+        area = np.vstack((line_on_image(left, M_inv), line_on_image(right, M_inv)[::-1])).astype(np.int32)
+        cv2.fillPoly(overlay, [area], EGO_FILL if is_ego else OTHER_FILL)
     out = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
-    cv2.polylines(out, [lf.astype(np.int32)], False, (255, 0, 0), 3)
-    cv2.polylines(out, [rg.astype(np.int32)], False, (0, 0, 255), 3)
+
+    # unique boundaries, left to right: first left line + the right line of every lane
+    boundaries = [lanes[0][0]] + [ln[1] for ln in lanes]
+    for k, line in enumerate(boundaries):
+        pts = line_on_image(line, M_inv).astype(np.int32)
+        cv2.polylines(out, [pts], False, LINE_COLORS[k % len(LINE_COLORS)], thickness, cv2.LINE_AA)
     return out
 
 
-# ---------------- funzione principale ----------------
-def lane_fitting(img_tresh, img, M_inv):
-    pts_dict = points_in_meters(img_tresh)
-    pts = np.column_stack((pts_dict["x"], pts_dict["z"]))   # una riga per punto: (x, z)
+# ---------------- curvature and prediction ----------------
+def support_points(line, pts):
+    """Return the (x, z) points supporting a boundary, or None if they are not reliable (estimated edge)."""
+    if line.get("estimated"):
+        return None
+    if line.get("inliers") is not None:
+        return pts[line["inliers"]]
+    return line.get("pts")
 
-    cands = find_candidates(pts)
-    pair = best_pair(cands)
 
-    ransac_sx = ransac_dx = None
-    stimata = False
-    if pair is not None:
-        ransac_sx, ransac_dx = pair
-    elif cands:
-        # nessuna coppia plausibile: tengo la retta con piu' inlier e stimo l'altro lato
-        best = max(cands, key=lambda c: int(c["inliers"].sum()))
-        ransac_sx, ransac_dx = missing_side(best)
-        stimata = True
+def fit_boundary_poly(line, pts):
+    """Fit x = c*z^2 + a*z + b on a boundary's support points; fall back to the straight line [0, a, b]."""
+    p = support_points(line, pts)
+    if p is not None and len(p) >= MIN_POLY_POINTS and np.ptp(p[:, 1]) >= MIN_POLY_SPAN_FRAC * (Z_RANGE[1] - Z_RANGE[0]):
+        c, a, b = np.polyfit(p[:, 1], p[:, 0], 2)
+        if abs(2 * c) <= MAX_CURVATURE:
+            return np.array([c, a, b])
+    return np.array([0.0, line["a"], line["b"]])
 
-    out = dict(points=pts_dict, pts=pts, candidates=cands,
-               ransac_sx=ransac_sx, ransac_dx=ransac_dx, stimata=stimata)
-    if ransac_sx and ransac_dx:
-        out["overlay"] = draw_line(img, M_inv, ransac_sx, ransac_dx)
+
+def ego_centerline(ego, pts):
+    """Centerline of the ego lane as x = c*z^2 + a*z + b (mean of the two boundary polynomials)."""
+    coeffs = 0.5 * (fit_boundary_poly(ego[0], pts) + fit_boundary_poly(ego[1], pts))
+    return dict(c=float(coeffs[0]), a=float(coeffs[1]), b=float(coeffs[2]))
+
+
+def curvature_at(center, z):
+    """Signed curvature [1/m] of x(z) at depth z (positive = curving right) and radius [m]."""
+    slope = 2 * center["c"] * z + center["a"]
+    kappa = 2 * center["c"] / (1 + slope ** 2) ** 1.5
+    radius = 1.0 / abs(kappa) if abs(kappa) > 1e-6 else 1e6
+    return float(kappa), float(min(radius, 1e6))
+
+
+def lookahead_point(center, lookahead=LOOKAHEAD_M):
+    """First point of the centerline at distance >= lookahead from the vehicle origin (x=0, z=EGO_Z_M)."""
+    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 200)
+    x = center["c"] * z ** 2 + center["a"] * z + center["b"]
+    ok = np.flatnonzero(np.hypot(x, z - EGO_Z_M) >= lookahead)
+    i = int(ok[0]) if len(ok) else len(z) - 1
+    return float(x[i]), float(z[i])
+
+
+def draw_prediction(img, M_inv, center, target):
+    """Draw the blue centerline and the red lookahead dot on the image (in place)."""
+    cv2.polylines(img, [line_on_image(center, M_inv).astype(np.int32)], False, (0, 0, 255), 3, cv2.LINE_AA)
+    u, v = bev_points_on_image([target[0]], [target[1]], M_inv)[0]
+    cv2.circle(img, (int(u), int(v)), 8, (255, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(img, (int(u), int(v)), 10, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+# ---------------- main function ----------------
+def lane_fitting(pipe, img, vehicles=()):
+    """Run the full lane-detection pipeline to estimate road boundaries, candidate lane markings, and final lanes."""
+    safe = cv2.erode(pipe["valid"].astype(np.uint8), np.ones((17, 17), np.uint8)) > 0
+    edge_l, edge_r = road_edges(pipe["road"], safe)
+    raw_edges = [e for e in (edge_l, edge_r) if e]
+    a_ref = float(np.mean([e["a"] for e in raw_edges])) if raw_edges else 0.0
+
+    pts_dict = restrict_to_edges(points_in_meters(pipe["thresh"]), edge_l, edge_r)
+    pts = np.column_stack((pts_dict["x"], pts_dict["z"]))
+    cands = find_candidates(pts, a_ref=a_ref)
+    paint = pipe["grad_thr"][pts_dict["row"], pts_dict["column"]] > 0
+    grad_ref = float(np.percentile(pipe["grad"][pipe["valid"]], RIDGE_REF_PCT))
+    for c in cands:
+        c["paint"] = float(paint[c["inliers"]].mean())
+        c["cov_m"] = coverage(pts, c["inliers"]) * COV_BIN_M
+        c["ridge_m"] = ridge_cov(c, pipe["grad"], grad_ref)
+
+    lanes = build_lanes(cands, edge_l, edge_r, pipe.get("ego_prob"))
+    ego = next((ln for ln in lanes if ln[2]), None)
+
+    out = dict(points=pts_dict, pts=pts, candidates=cands, edges=[e for e in (edge_l, edge_r) if e], lanes=lanes,
+                ransac_sx=ego[0] if ego else None, ransac_dx=ego[1] if ego else None)
+    if ego:
+        center = ego_centerline(ego, pts)
+        kappa, radius = curvature_at(center, Z_RANGE[0])
+        target = lookahead_point(center)
+        out.update(center=center, curvature=kappa, radius=radius, target=target)
+        curved = [[dict(zip("cab", fit_boundary_poly(l, pts))) for l in ego[:2]] + [True]]
+        out["overlay"] = draw_lanes(img, pipe["M_inv"], curved)
+        draw_prediction(out["overlay"], pipe["M_inv"], center, target)
+        lead = lead_vehicle(vehicles, ego[0], ego[1])
+        out["lead"] = lead
+        out["v_max"] = None if lead is None else max(0.0, (lead["z"] - D_MIN_M) / T_GAP_S)
+        draw_lead(out["overlay"], pipe["M_inv"], lead, ego[0], ego[1])
     return out
 
 
-def plot_bev_debug(img_tresh, fitting_out):
+def plot_bev_debug(img_thresh, fitting_out, out_path):
+    """Save a BEV debug plot showing the road, candidates, and final fitted lane lines."""
     fig, ax = plt.subplots(figsize=(7, 8))
-    ax.imshow(
-        img_tresh,
-        cmap="gray",
-        origin="upper",
-        extent=(X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1]),
-        aspect="auto",
-    )
-    ax.axvline(0, color="yellow", linestyle="--", linewidth=1, label="Centro veicolo")
+    ax.imshow(img_thresh, cmap="gray", origin="upper", extent=(X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1]), aspect="auto")
+    ax.axvline(0, color="yellow", linestyle="--", linewidth=1, label="vehicle centre")
 
     pts = fitting_out["pts"]
-    for label, line_key, color in (("Sinistra", "ransac_sx", "red"), ("Destra", "ransac_dx", "cyan")):
+    for label, line_key, color in (("Left", "ransac_sx", "red"), ("Right", "ransac_dx", "cyan")):
         line = fitting_out[line_key]
         if line is None:
-            ax.plot([], [], color=color, label=f"{label}: retta non trovata")
+            ax.plot([], [], color=color, label=f"{label}: line not found")
             continue
 
         if line.get("inliers") is not None:
             inl = pts[line["inliers"]]
-            ax.scatter(inl[:, 0], inl[:, 1], s=5, color=color,
-                       label=f"Inlier {label.lower()} ({len(inl)})")
+            ax.scatter(inl[:, 0], inl[:, 1], s=5, color=color, label=f"Inliers {label.lower()} ({len(inl)})")
             z_values = np.linspace(inl[:, 1].min(), inl[:, 1].max(), 100)
-            style = "-"
-            name = f"Retta {label.lower()}"
+            style, name = "-", f"Line {label.lower()}"
         else:
-            # lato stimato dalla larghezza di default: tratteggiato su tutto il range
             z_values = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
-            style = "--"
-            name = f"Retta {label.lower()} (STIMATA)"
+            style, name = "-.", f"Line {label.lower()} (road edge)"
         ax.plot(line["a"] * z_values + line["b"], z_values,
                 color=color, linewidth=2, linestyle=style, label=name)
 
-    ax.set(
-        xlabel="x laterale (m)",
-        ylabel="z in avanti (m)",
-        title="Bird-Eye View: pixel candidati e inlier RANSAC",
-        xlim=X_RANGE,
-        ylim=Z_RANGE,
-    )
+    ax.set(xlabel="lateral x (m)", ylabel="forward z (m)", title="Bird-eye view: candidates and RANSAC inliers", xlim=X_RANGE, ylim=Z_RANGE)
     ax.grid(alpha=0.2)
     ax.legend(loc="upper right")
     fig.tight_layout()
-    plt.show()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def save_candidates(img, img_thresh, pts, cands, M_inv, out_bev, out_img):
+    """Export a visualization of all candidate lane lines in BEV and in the original camera image."""
+    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
+
+    # 1) bird-eye view with all candidates
+    fig, ax = plt.subplots(figsize=(7, 8))
+    ax.imshow(img_thresh, cmap="gray", origin="upper", extent=(X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1]), aspect="auto")
+    ax.axvline(0, color="yellow", linestyle="--", linewidth=1)
+
+    vis = img.copy()
+    for k, c in enumerate(cands):
+        name = CAND_COLORS[k % len(CAND_COLORS)]
+        n_inl = 0
+        if c.get("inliers") is not None:
+            inl = pts[c["inliers"]]
+            ax.scatter(inl[:, 0], inl[:, 1], s=4, color=name)
+            n_inl = len(inl)
+        tag = " (road edge)" if c.get("edge") else ""
+        ax.plot(c["a"] * z + c["b"], z, color=name, linewidth=2,
+                label=f"cand {k}{tag}: a={c['a']:+.2f} b={c['b']:+.2f} inl={n_inl}")
+
+        pts_px = line_on_image(c, M_inv).astype(np.int32)
+        cv2.polylines(vis, [pts_px], False, cv2_color(name), 3)
+
+    ax.set(xlabel="lateral x (m)", ylabel="forward z (m)", title="RANSAC candidates", xlim=X_RANGE, ylim=Z_RANGE)
+    ax.grid(alpha=0.2)
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_bev, dpi=150)
+    plt.close(fig)
+
+    # 2) original image with all candidates reprojected
+    cv2.imwrite(out_img, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+
+def print_candidate_stats(out):
+    """Print the numbers that decide snapping and lane selection."""
+    for k, c in enumerate(out["candidates"]):
+        print(f"cand {k}: x@mid={x_at(c):+.2f} a={c['a']:+.2f} cov={c['cov_m']:.1f}m "
+                f"paint={c['paint']:.2f} ridge={c['ridge_m']:.1f}m inl={int(c['inliers'].sum())}")
+    for l, r, _ in out["lanes"]:
+        for name, ln in (("left", l), ("right", r)):
+            print(f"ego {name}: x@mid={x_at(ln):+.2f} edge={ln.get('edge', False)} snapped={ln.get('snapped', False)}")
