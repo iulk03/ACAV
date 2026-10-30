@@ -20,7 +20,7 @@ SINGLE = None
 TYPE = 0 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 
-wrong = [61]
+wrong = [7,26,30,44,45,46,47,61,76]
 
 def execute(img_idx, img_type):
     type = sorted(glob.glob(f"{ROOT}/training/image_2/{img_type}_*.png"))

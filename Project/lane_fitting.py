@@ -27,13 +27,15 @@ N_CANDIDATES = 10               # how many candidate lines to search for
 SLOPE_DELTA_MAX = 0.4           # max slope difference to be considered parallel
 MERGE_DIST_M = 2.0              # painted line vs road edge: closer than this = duplicate of the edge marking
 MIN_LANE_WIDTH_M = 2.5          # painted vs painted: no real lane is narrower than this
+
+
 ROAD_EDGE_THRESHOLD_M = 0.25
 ROAD_EDGE_MIN_INLIERS = 40
 ROAD_GAP_M = 3.5                # max non-road gap between the vehicle column and the first road run (shadow holes)
 EDGE_PARALLEL_TOL = 0.12
 EGO_Z_M = 0.0
 EGO_CHECK_Z_M = Z_RANGE[0]      # depth at which the ego lane is decided (no extrapolation outside the BEV)
-PAINT_MIN_FRAC = 0.3            # start at 0.0 (filter off): first measure, then set it
+PAINT_MIN_FRAC = 0.2            # start at 0.0 (filter off): first measure, then set it
 SNAP_MIN_RIDGE_FRAC = 0.4       # snap: ridge coverage (fraction of BEV depth) accepted as paint evidence
 EGO_AXIS_TOL_M = 0.8            # a lane is an ego candidate if the vehicle axis falls inside it, widened by this tolerance
 
@@ -127,11 +129,11 @@ def select_interior(cands, left_edge, right_edge):
         pool = [c for c in pool if x_at(c) > x_at(left_edge) + MERGE_DIST_M]
     if right_edge:
         pool = [c for c in pool if x_at(c) < x_at(right_edge) - MERGE_DIST_M]
-
+    """
     for c in cands:
             print(f"  x@mid={x_at(c):+.2f} paint={c['paint']:.2f} cov={c['cov_m']:.1f} "
                     f"ridge={c['ridge_m']:.1f} score={line_score(c):.1f} "
-                    f"in_pool={c in pool}")
+                    f"in_pool={c in pool}")"""
             
     pool.sort(key=line_score, reverse=True)
     keep = list(edges)
