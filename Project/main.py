@@ -16,7 +16,7 @@ for file_path in OUT_DIR.iterdir():
         if file_path.is_file():
             file_path.unlink()
 # set this variable to a number to process one image, None to process all the images for a specific type, w to process only wrongly detected images
-SINGLE = 'w'
+SINGLE = None
 TYPE = 0 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 

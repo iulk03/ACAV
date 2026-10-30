@@ -489,13 +489,22 @@ def support_points(line, pts):
 
 
 def fit_boundary_poly(line, pts):
-    """Fit x = c*z^2 + a*z + b on a boundary's support points; fall back to the straight line [0, a, b]."""
+    straight = np.array([0.0, line["a"], line["b"]])
+    if line.get("edge") and not line.get("snapped"):
+        return straight                      # contorno maschera: la curvatura non è affidabile
     p = support_points(line, pts)
-    if p is not None and len(p) >= MIN_POLY_POINTS and np.ptp(p[:, 1]) >= MIN_POLY_SPAN_FRAC * (Z_RANGE[1] - Z_RANGE[0]):
-        c, a, b = np.polyfit(p[:, 1], p[:, 0], 2)
-        if abs(2 * c) <= MAX_CURVATURE:
-            return np.array([c, a, b])
-    return np.array([0.0, line["a"], line["b"]])
+    if p is None or len(p) < MIN_POLY_POINTS or np.ptp(p[:, 1]) < MIN_POLY_SPAN_FRAC * (Z_RANGE[1] - Z_RANGE[0]):
+        return straight
+    z, x = p[:, 1], p[:, 0]
+    c, a, b = np.polyfit(z, x, 2)
+    if abs(2 * c) > MAX_CURVATURE:
+        return straight
+    # la parabola deve spiegare i punti molto meglio della retta, altrimenti è rumore
+    rss_lin = np.sum((x - np.polyval(np.polyfit(z, x, 1), z)) ** 2)
+    rss_quad = np.sum((x - np.polyval([c, a, b], z)) ** 2)
+    if rss_quad > 0.7 * rss_lin:
+        return straight
+    return np.array([c, a, b])
 
 
 def ego_centerline(ego, pts):
