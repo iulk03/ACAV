@@ -16,9 +16,18 @@ BLOCK_PX = 60               # column block used for the local percentile
 MIN_BLOCK_PIXELS = 100      # below this many region pixels in a block, use the global threshold
 ROAD_ERODE_PX = 15          # ~0.5 m: keeps painted-line candidates away from the road border
 MIN_ROAD_FRAC = 0.10        # if the road mask covers less than this, consider it failed
-LINE_WIDTH_PX = 13      # ~0.43 m: anything wider than this is not paint
-LINE_MIN_LEN_PX = 21    # ~0.7 m: anything shorter vertically is not a marking
-MIN_WEDGE_M = 2.5       # sanity bounds on the road width
+LINE_WIDTH_PX = 13          # ~0.43 m: anything wider than this is not paint
+LINE_MIN_LEN_PX = 21        # ~0.7 m: anything shorter vertically is not a marking
+MIN_WEDGE_M = 2.5           # sanity bounds on the road width
+COLOR_TOPHAT_PX = 15        # ~0.5 m ellipse: keeps bright structures narrower than this (markings), drops broad ones
+COLOR_TOPHAT_THR = 28       # min top-hat response on L
+DARK_BLACKHAT_THR = 15      # min black-hat response on gray to call a pixel "dark line"
+DARK_DILATE_PX = 5          # grow the dark mask to also cover the flanking Sobel/chroma edges
+BRIGHT_PROTECT_THR = 20     # pixels with a white top-hat above this are never suppressed
+WHITE_MIN_L = 100           # lightness floor for white paint
+YELLOW_LO = (12, 60, 80)    # OpenCV HLS: H, L, S
+YELLOW_HI = (38, 255, 255)
+COLOR_SLOPE_TOL = 0.06      # blob x-extent allowed beyond |a_ref| * height (same tolerance as SLOPE_TOL)
 MAX_WEDGE_M = 12.0
 
 USE_OLD_SOBEL = True        # prova: unisce al segnale ridge anche il vecchio Sobel
@@ -83,6 +92,27 @@ def brid_eye_view(img, trapezoid, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_
     bev = cv2.warpPerspective(img, M, (width, height))
     return bev, M, M_inv
 
+def drop_non_line_blobs(mask, a_ref=0.0):
+    """Keep only elongated, road-parallel blobs: drops painted arrows, stop lines, crosswalks and specks."""
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        w, h = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+        # a line parallel to the road has x-extent <= slope * height + stroke width; arrows/stop lines exceed it
+        keep[i] = h >= LINE_MIN_LEN_PX and w <= (abs(a_ref) + COLOR_SLOPE_TOL) * h + LINE_WIDTH_PX
+    return (keep[lab] * 255).astype(np.uint8)
+
+
+def color_markings(bev, region, a_ref=0.0):
+    """White (top-hat on L) + yellow (HLS window) paint in the BEV, restricted to the UNet road region."""
+    hls = cv2.cvtColor(cv2.GaussianBlur(bev, (5, 5), 0), cv2.COLOR_RGB2HLS)   # bev is RGB
+    L = hls[:, :, 1]
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (COLOR_TOPHAT_PX, COLOR_TOPHAT_PX))
+    white = (cv2.morphologyEx(L, cv2.MORPH_TOPHAT, k) > COLOR_TOPHAT_THR) & (L > WHITE_MIN_L)
+    yellow = cv2.inRange(hls, YELLOW_LO, YELLOW_HI) > 0
+    mask = ((white | yellow) & region).astype(np.uint8) * 255
+    return drop_non_line_blobs(mask, a_ref)
+
 
 # ---------------- gradient segmentation (painted lines) ----------------
 def gaussian_filter(img, ksize=GAUSS_KSIZE):
@@ -130,6 +160,21 @@ def line_ridge(gray, valid, a=0.0):
     ridge = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, k_w)
     ridge = cv2.morphologyEx(ridge, cv2.MORPH_OPEN, slanted_kernel(a))
     return ridge * valid
+
+def dark_line_mask(gray, valid):
+    """
+    Pixels belonging to (or flanking) a thin DARK stripe (gray - black - gray: cracks, tar seams,
+    thin shadows). Bright stripes (gray - white - gray) are protected, so painted lines are kept.
+    """
+    k_w = cv2.getStructuringElement(cv2.MORPH_RECT, (LINE_WIDTH_PX, 1))
+    black = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, k_w).astype(np.int16)
+    white = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, k_w).astype(np.int16)
+
+    dark = ((black > DARK_BLACKHAT_THR) & (black > white)).astype(np.uint8)
+    dark = cv2.dilate(dark, np.ones((1, 2 * DARK_DILATE_PX + 1), np.uint8))   # horizontal only: flanks
+    bright_core = (white > BRIGHT_PROTECT_THR).astype(np.uint8)
+    bright_core = cv2.dilate(bright_core, np.ones((1, 3), np.uint8))
+    return (dark > 0) & (bright_core == 0) & valid
 
 
 def road_wedge(edge_l, edge_r, shape):
@@ -185,17 +230,24 @@ def lane_pipeline(calib_path, img, out_path=None):
     edges = [e for e in (edge_l, edge_r) if e]
     a_ref = float(np.mean([e["a"] for e in edges])) if edges else 0.0
     grad = line_ridge(gray, valid, a=a_ref).astype(np.float64)
+    dark = dark_line_mask(gray, valid)                    
 
-    #prova per sobel
-    grad_thr = threshold(grad, region)                   # solo ridge: serve al punteggio "paint"
+    grad_thr = threshold(grad, region)
     grad_thr_all = grad_thr
     if USE_OLD_SOBEL:
         sobel = gradient_filter(gray)
         sobel_thr = threshold(sobel, region)
         grad_thr_all = cv2.bitwise_or(grad_thr, sobel_thr)
 
+    color = color_markings(bev, region, a_ref)
     chroma = nc.chroma_edges(bev, valid)
-    thresh = cv2.bitwise_or(grad_thr_all, chroma)
+
+    # dark stripes must never reach RANSAC
+    grad_thr_all[dark] = 0
+    grad_thr[dark] = 0                                    # also keeps them out of the "paint" score
+    chroma[dark] = 0
+
+    thresh = cv2.bitwise_or(cv2.bitwise_or(grad_thr_all, chroma), color)
     #fin e prova sobel
 
     if out_path is not None:
@@ -211,9 +263,12 @@ def lane_pipeline(calib_path, img, out_path=None):
             ("Road edge", road_edge, "gray"),
             ("Colour edges", chroma, "gray"),
             ("Final threshold", thresh, "gray"),
+            ("Colour mask (paint)", color, "gray"),
+            ("Dark mask", dark.astype(np.uint8) * 255, "gray"),
+            ("Ego-lane prob", ego_prob, "gray"),
         ], out_path)
 
-    return dict(M=M, M_inv=M_inv, thresh=thresh, road_edge=road_edge, road=road, valid=valid, gray=gray, grad=grad, grad_thr=grad_thr, ego_prob=ego_prob)
+    return dict(M=M, M_inv=M_inv, thresh=thresh, road_edge=road_edge, road=road, valid=valid, gray=gray, grad=grad, grad_thr=grad_thr, ego_prob=ego_prob, color=color)
 
 
 def save_panels(panels, out_path, ncols=3):

@@ -12,15 +12,21 @@ OUT_DIR = BASE_DIR / "debug_images"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 OPTIONS = {'um':94, 'umm':95, 'uu':97}
 
-for file_path in OUT_DIR.iterdir():
+# delete previously generated images
+'''for file_path in OUT_DIR.iterdir():
         if file_path.is_file():
             file_path.unlink()
-# set this variable to a number to process one image, None to process all the images for a specific type, w to process only wrongly detected images
-SINGLE = 'w'
+if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
+    print('Folder emptied')'''
+
+# number --> one image
+# None   --> all the images of the specificied type
+# 'w'    --> only wrongly detected images
+SINGLE = 5
 TYPE = 0 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 
-wrong = [10, 11, 12, 28, 29, 30, 33, 34, 38, 40, 45, 47, 61, 62, 64, 65, 76, 93]
+wrong = [5, 24, 26, 33, 34, 35, 38, 44, 47, 56, 60, 61, 63, 65, 66, 67, 93]
 
 def execute(img_idx, img_type):
     type = sorted(glob.glob(f"{ROOT}/training/image_2/{img_type}_*.png"))
@@ -33,7 +39,7 @@ def execute(img_idx, img_type):
 
     vehicles = lf.vehicles_to_road(vd.detect_vehicles(img), pipe["M"])
     out = lf.lane_fitting(pipe, img, vehicles)
-    lf.print_candidate_stats(out)
+    #lf.print_candidate_stats(out)
 
     lf.plot_bev_debug(pipe["thresh"], out, OUT_DIR / f"{stem}_candidates.png")
     lf.save_candidates(img, pipe["thresh"], out["pts"], out["candidates"] + out["edges"], pipe["M_inv"], OUT_DIR / f"00_{stem}_cands_bev.png", OUT_DIR / f"{stem}_cands_img.png")
@@ -59,3 +65,7 @@ else:
             execute(idx, type)
     else:
         execute(SINGLE, type)
+
+
+# TODO: lane edge entirely included in the road mask, lane mask should be used better, 
+#       polyfit del boundary solo se c'è linea bianca (color mask), auto vanno evitate (not included in the overlay img 72)
