@@ -80,6 +80,9 @@ MIN_POLY_SPAN_FRAC = 0.5        # support points must span at least this fractio
 POLY_MAX_CURVATURE = 0.01       # 1/m: |2c| above this (R < 100 m) -> keep the straight line
 POLY_MIN_GAIN = 0.7             # quadratic rms must be below this fraction of the straight rms
 POLY_STRAIGHT_RMS_M = 0.05      # if the straight fit is already this good (5 cm), do not curve
+EDGE_SUPPORT_M = 0.6            # road-edge support points: kept within this distance of the straight fit (curves deviate more than 0.25 m)
+EDGE_POLY_MIN_GAIN = 0.85       # road edges: quadratic rms must be below this fraction of the straight rms (looser than POLY_MIN_GAIN)
+EDGE_POLY_STRAIGHT_RMS_M = 0.03 # road edges: do not curve if the straight fit is already this good
 MAX_CURVATURE = 0.05            # 1/m: |kappa| above this (R < 20 m) is treated as a bad fit -> straight line
 LOOKAHEAD_M = 10.0              # distance from the vehicle (z = EGO_Z_M) of the red target point
 D_MIN_M = 5.0                   # minimum gap to the lead vehicle
@@ -111,13 +114,24 @@ def vehicles_to_road(dets, M):
         d.update(x_l=float(x[0]), x_r=float(x[2]), z=float(z[1]), xf_l=float(x[3]), xf_r=float(x[4]))
     return dets
 
+
+def shift_line(line, dx):
+    """Translate a boundary laterally by dx metres (slope/curvature kept) and move its support points with it."""
+    out = dict(line, b=line["b"] + dx, shifted=True)
+    if line.get("inliers") is None and line.get("pts") is not None:   # road edge: support points are stored explicitly
+        out["pts"] = line["pts"] + np.array([dx, 0.0])
+    return out
+
+
 def avoid_parked_vehicles(left, right, vehicles):
     """
     Translate an ego boundary in x so it does not run over a parked vehicle. 'Parked' = the whole vehicle footprint lies in
     the outer half of the lane at its depth (the lead vehicle crosses the lane centre and is never used). The lane is never
-    narrowed below MIN_LANE_WIDTH_M. The boundary keeps its slope/curvature; support points are dropped so fit_boundary_poly
-    cannot re-fit the old position.
+    narrowed below MIN_LANE_WIDTH_M. The boundary keeps its slope/curvature and its support points are translated with it,
+    so fit_boundary_poly can still fit the curvature. Returns (left, right, blockers): blockers = vehicles that really
+    narrowed the lane.
     """
+    blockers = []
     for v in vehicles:
         z = v["z"]
         if v["label"] not in PARKED_LABELS or not (Z_RANGE[0] - VEHICLE_LEN_M <= z <= Z_RANGE[1]):
@@ -127,12 +141,14 @@ def avoid_parked_vehicles(left, right, vehicles):
         if mid < v["xf_l"] < xr:                       # vehicle in the right half of the lane
             target = v["xf_l"] - PARKED_CLEARANCE_M
             if target - xl >= MIN_LANE_WIDTH_M:
-                right = dict(right, b=right["b"] + target - xr, shifted=True, pts=None)
+                right = shift_line(right, target - xr)
+                blockers.append(v)
         elif xl < v["xf_r"] < mid:                     # vehicle in the left half of the lane
             target = v["xf_r"] + PARKED_CLEARANCE_M
             if xr - target >= MIN_LANE_WIDTH_M:
-                left = dict(left, b=left["b"] + target - xl, shifted=True, pts=None)
-    return left, right
+                left = shift_line(left, target - xl)
+                blockers.append(v)
+    return left, right, blockers
 
 
 def lead_vehicle(vehicles, left, right):
@@ -140,6 +156,14 @@ def lead_vehicle(vehicles, left, right):
     hits = [v for v in vehicles
             if v["z"] > 0 and v["x_r"] > x_at(left, v["z"]) and v["x_l"] < x_at(right, v["z"])]
     return min(hits, key=lambda v: v["z"], default=None)
+
+
+def draw_blockers(img, blockers):
+    """Draw the bbox of the vehicles that narrowed the ego lane (in place)."""
+    for v in blockers:
+        x1, y1, x2, y2 = v["box"].astype(int)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 255), 3)          # RGB magenta
+        cv2.putText(img, "parked", (x1, max(y1 - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2, cv2.LINE_AA)
 
 
 def draw_lead(img, M_inv, lead, left, right):
@@ -380,7 +404,7 @@ def road_edge_candidate(road, safe, direction):
             continue
         r["length"] = coverage(p, r["inliers"]) * COV_BIN_M    # straight length (m) covered by the inliers
         r["n_inl"] = int(r["inliers"].sum())
-        r["pts"] = p[r["inliers"]]             # support points, needed for the quadratic fit
+        r["pts"] = p[line_distance(p, r["a"], r["b"]) <= EDGE_SUPPORT_M]   # wider than the RANSAC inliers: a curve deviates from the straight fit
         r["inliers"] = None
         r["edge"] = True
         r["mode"] = mode                   # for debugging
@@ -641,7 +665,13 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M, a_ref=
     return cands
 
 
-def line_score(c):
+def line_score(c, prints=False):
+    if prints:
+        print(f'RIDGE_BONUS: {c["cov_m"] + RIDGE_BONUS * c.get("ridge_m", 0.0)}'
+                f'COLOR_BONUS: {COLOR_BONUS * c.get("color_m", 0.0)}'
+                f'TIGHT_BONUS: {TIGHT_BONUS * c.get("tight_m", 0.0)}'
+                f'EGO_EDGE_BONUS: {EGO_EDGE_BONUS * c.get("ego_m", 0.0)}'
+                f'SIM_BONUS: {SIM_BONUS * c.get("sim_m", 0.0)}')
     return (c["cov_m"] + RIDGE_BONUS * c.get("ridge_m", 0.0) + COLOR_BONUS * c.get("color_m", 0.0)
             + TIGHT_BONUS * c.get("tight_m", 0.0) + EGO_EDGE_BONUS * c.get("ego_m", 0.0)
             + SIM_BONUS * c.get("sim_m", 0.0))
@@ -754,11 +784,13 @@ def fit_boundary_poly(line, pts, color_near=None):
     """Quadratic x = c*z^2 + a*z + b on a boundary's support points, accepted only if it clearly beats the straight fit."""
     straight = np.array([line.get("c", 0.0), line["a"], line["b"]])
     if line.get("inliers") is not None:
-        return straight          # RANSAC candidate: its own model (line or parabola) was already chosen by ransac_best --------------- HERE
+        return straight          # RANSAC candidate: its own model (line or parabola) was already chosen by ransac_best
     p = support_points(line, pts)
     if p is None or len(p) < MIN_POLY_POINTS or np.ptp(p[:, 1]) < MIN_POLY_SPAN_FRAC * (Z_RANGE[1] - Z_RANGE[0]):
         return straight
-    if color_near is not None and paint_support_frac(p, color_near) < POLY_PAINT_MIN_FRAC:
+    is_edge = bool(line.get("edge"))
+    # road edges have no paint: the road mask is their evidence, so the paint gate only applies to non-edge lines
+    if color_near is not None and not is_edge and paint_support_frac(p, color_near) < POLY_PAINT_MIN_FRAC:
         return straight
 
     # one sample per z-bin: dense clusters must not dominate the fit
@@ -774,7 +806,9 @@ def fit_boundary_poly(line, pts, color_near=None):
     rms_q = float(np.sqrt(np.mean((x - np.polyval([c, a, b], z)) ** 2)))
     rms_l = float(np.sqrt(np.mean((x - np.polyval([a1, b1], z)) ** 2)))
 
-    if abs(2 * c) > POLY_MAX_CURVATURE or rms_l < POLY_STRAIGHT_RMS_M or rms_q > POLY_MIN_GAIN * rms_l:
+    min_gain = EDGE_POLY_MIN_GAIN if is_edge else POLY_MIN_GAIN
+    straight_rms = EDGE_POLY_STRAIGHT_RMS_M if is_edge else POLY_STRAIGHT_RMS_M
+    if abs(2 * c) > POLY_MAX_CURVATURE or rms_l < straight_rms or rms_q > min_gain * rms_l:
         return straight
     return np.array([c, a, b])
 
@@ -839,8 +873,9 @@ def lane_fitting(pipe, img, vehicles=()):
     lanes = build_lanes(cands, edge_l, edge_r, pipe.get("ego_prob"))
     ego = next((ln for ln in lanes if ln[2]), None)
 
+    blockers = []
     if ego and AVOID_PARKED:
-        ego[0], ego[1] = avoid_parked_vehicles(ego[0], ego[1], vehicles)
+        ego[0], ego[1], blockers = avoid_parked_vehicles(ego[0], ego[1], vehicles)
 
     out = dict(points=pts_dict, pts=pts, candidates=cands, edges=[e for e in (edge_l, edge_r) if e], lanes=lanes,
                 ransac_sx=ego[0] if ego else None, ransac_dx=ego[1] if ego else None)
@@ -854,6 +889,7 @@ def lane_fitting(pipe, img, vehicles=()):
         curved = [[dict(zip("cab", fit_boundary_poly(l, pts, color_near))) for l in ego[:2]] + [True]]
         out["overlay"] = draw_lanes(img, pipe["M_inv"], curved)
         draw_prediction(out["overlay"], pipe["M_inv"], center, target)
+        draw_blockers(out["overlay"], blockers)
         lead = lead_vehicle(vehicles, ego[0], ego[1])
         out["lead"] = lead
         out["v_max"] = None if lead is None else max(0.0, (lead["z"] - D_MIN_M) / T_GAP_S)
@@ -930,7 +966,7 @@ def print_candidate_stats(out):
     """Print the numbers that decide snapping and lane selection."""
     for k, c in enumerate(out["candidates"]):
         print(f"cand {k}: x@mid={x_at(c):+.2f} a={c['a']:+.2f} cov={c['cov_m']:.1f}m "
-                f"paint={c['paint']:.2f} ridge={c['ridge_m']:.1f}m inl={int(c['inliers'].sum())} ego={c['ego_m']:.1f}m sim={c.get('sim_m', 0.0):.1f}m score: {line_score(c):.2f} ")
+                f"paint={c['paint']:.2f} ridge={c['ridge_m']:.1f}m inl={int(c['inliers'].sum())} ego={c['ego_m']:.1f}m sim={c.get('sim_m', 0.0):.1f}m score: {line_score(c, True):.2f} ")
     for l, r, _ in out["lanes"]:
         for name, ln in (("left", l), ("right", r)):
             print(f"ego {name}: x@mid={x_at(ln):+.2f} edge={ln.get('edge', False)} snapped={ln.get('snapped', False)}")
