@@ -23,7 +23,18 @@ NET_PATH = BASE_DIR / "road_net.pt"
 ROAD_THR = 0.5       # threshold on the road probability
 CHROMA_MIN = 40.0    # colour gradient threshold (OpenCV Lab, Sobel 3x3)
 SEED = 0
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+import torch
+
+def pick_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
+    return torch.device("cpu")
+
+DEVICE = pick_device()
+print("Device:", DEVICE)
+
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
@@ -214,8 +225,7 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
                 ms.append(torch.cat([tensor(valid), tensor(lane_valid)], 1))
             x, y, m = (torch.cat(t).to(DEVICE) for t in (xs, ys, ms))
             logits = net(x)
-            loss = masked_dice_bce(logits[:, :1], y[:, :1], m[:, :1]) + \
-                   masked_dice_bce(logits[:, 1:], y[:, 1:], m[:, 1:])
+            loss = masked_dice_bce(logits[:, :1], y[:, :1], m[:, :1]) + masked_dice_bce(logits[:, 1:], y[:, 1:], m[:, 1:])
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -228,8 +238,8 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
             eta = elapsed / done * (all_batches - done)
             filled = int(30 * done / all_batches)
             print(f"\r[{'#' * filled}{'-' * (30 - filled)}] {100 * done / all_batches:5.1f}% | "
-                  f"epoch {ep + 1}/{epochs} | batch {b}/{n_batches} | loss {total / b:.4f} | "
-                  f"elapsed {fmt_time(elapsed)} | ETA {fmt_time(eta)}", end="", flush=True)
+                    f"epoch {ep + 1}/{epochs} | batch {b}/{n_batches} | loss {total / b:.4f} | "
+                    f"elapsed {fmt_time(elapsed)} | ETA {fmt_time(eta)}", end="", flush=True)
 
         sched.step()
         history["loss"].append(total / max(n_batches, 1))
@@ -360,5 +370,4 @@ def chroma_edges(img_bev, valid_bev, min_grad=CHROMA_MIN, percentile=97, block=6
 
 
 if __name__ == "__main__":
-    import lane_fitting  # (import order: lane_fitting first, avoids the circular import)
     train()
