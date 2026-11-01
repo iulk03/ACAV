@@ -252,7 +252,7 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
         print(msg)
 
     print(f"training finished in {fmt_time(time.time() - t0)}")
-    torch.save(net.state_dict(), NET_PATH)
+    torch.save({k: v.cpu() for k, v in net.state_dict().items()}, NET_PATH)
     print("saved:", NET_PATH)
 
     # training curve: loss per epoch (left axis) and validation IoU (right axis)
