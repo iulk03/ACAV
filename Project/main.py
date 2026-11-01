@@ -13,20 +13,20 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 OPTIONS = {'um':94, 'umm':95, 'uu':97}
 
 # delete previously generated images
-'''for file_path in OUT_DIR.iterdir():
+for file_path in OUT_DIR.iterdir():
         if file_path.is_file():
             file_path.unlink()
 if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
-    print('Folder emptied')'''
+    print('Folder emptied')
 
 # number --> one image
 # None   --> all the images of the specificied type
 # 'w'    --> only wrongly detected images
-SINGLE = 5
+SINGLE = None
 TYPE = 0 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 
-wrong = [5, 24, 26, 33, 34, 35, 38, 44, 47, 56, 60, 61, 63, 65, 66, 67, 93]
+wrong = [8, 11, 25, 45, 48, 71]
 
 def execute(img_idx, img_type):
     type = sorted(glob.glob(f"{ROOT}/training/image_2/{img_type}_*.png"))
@@ -39,7 +39,7 @@ def execute(img_idx, img_type):
 
     vehicles = lf.vehicles_to_road(vd.detect_vehicles(img), pipe["M"])
     out = lf.lane_fitting(pipe, img, vehicles)
-    #lf.print_candidate_stats(out)
+    lf.print_candidate_stats(out)
 
     lf.plot_bev_debug(pipe["thresh"], out, OUT_DIR / f"{stem}_candidates.png")
     lf.save_candidates(img, pipe["thresh"], out["pts"], out["candidates"] + out["edges"], pipe["M_inv"], OUT_DIR / f"00_{stem}_cands_bev.png", OUT_DIR / f"{stem}_cands_img.png")
@@ -48,7 +48,7 @@ def execute(img_idx, img_type):
         cv2.imwrite(str(OUT_DIR / f"{stem}_overlay.png"), cv2.cvtColor(out["overlay"], cv2.COLOR_RGB2BGR))
         print(f"img: {img_idx}, lanes: {len(out['lanes'])} (ego found: {out['ransac_sx'] is not None})")
     else:
-        print(f"No lane found. Points: {len(out['pts'])}; painted candidates: {len(out['candidates'])}; "f"road edges: {len(out['edges'])}")
+        print(f"img: {img_idx} no lane found. Points: {len(out['pts'])}; painted candidates: {len(out['candidates'])}; "f"road edges: {len(out['edges'])}")
 
 
 if ALL:
@@ -67,5 +67,4 @@ else:
         execute(SINGLE, type)
 
 
-# TODO: lane edge entirely included in the road mask, lane mask should be used better, 
-#       polyfit del boundary solo se c'è linea bianca (color mask), auto vanno evitate (not included in the overlay img 72)
+# keep distance from vehicles, bonus for same slope edges, bonus for 

@@ -6,7 +6,7 @@ from lane_pipeline import X_RANGE, Z_RANGE, PX_PER_M
 
 # ---------------- RANSAC parameters ----------------
 MARGIN_PX = 6                   # ignore pixels too close to the image border
-INLINER_TRESHOLD_M = 0.2        # max distance to be an inlier
+INLINER_TRESHOLD_M = 0.1        # max distance to be an inlier
 MIN_SEPARATION_M = 2.0          # min z distance between the two points defining a line
 SUCCESS_PROBABILITY = 0.99
 MAX_ITER = 500
@@ -23,8 +23,9 @@ TIGHT_WEIGHT = 1.0              # RANSAC score = loose coverage + TIGHT_WEIGHT *
 TIGHT_BONUS = 2.0               # line_score bonus per metre of line covered by tight inliers
 
 # ---------------- candidate and lane parameters ----------------
-SNAP_MAX_DIST_M = 0.3           # a painted line replaces the mask edge only if it is this close to it
+SNAP_MAX_DIST_M = 0.4           # a painted line replaces the mask edge only if it is this close to it
 SNAP_MIN_COV_FRAC = 0.5         # and covers at least this fraction of the BEV depth
+SNAP_MAX_SLOPE_DIFF = 0.03      # a painted line replaces the mask edge only if its max |dx/dz| difference vs the edge is below this
 INTERIOR_MIN_SCORE_FRAC = 0.4   # interior line score vs the best interior line
 EDGE_BAND_M = 0.3               # RANSAC points are searched between the edges, widened by this band
 NARROW_MIN_COV_FRAC = 0.4       # a line closer than MIN_LANE_WIDTH_M to a road edge must cover at least this fraction of the BEV depth
@@ -33,7 +34,7 @@ N_CANDIDATES = 15               # how many candidate lines to search for
 SLOPE_DELTA_MAX = 0.4           # max slope difference to be considered parallel
 MERGE_DIST_M = 0.5              # painted line vs road edge: closer than this = duplicate of the edge marking
 MIN_LANE_WIDTH_M = 2.5          # painted vs painted: no real lane is narrower than this
-MAX_LANE_WIDTH_M = 5.0          # a lane wider than this (unless bounded by two road edges) is not a real lane
+MAX_LANE_WIDTH_M = 5.5          # a lane wider than this (unless bounded by two road edges) is not a real lane
 ROAD_EDGE_THRESHOLD_M = 0.25
 ROAD_EDGE_MIN_INLIERS = 40
 ROAD_GAP_M = 3.5                # max non-road gap between the vehicle column and the first road run (shadow holes)
@@ -44,19 +45,34 @@ PAINT_MIN_FRAC = 0.3            # start at 0.0 (filter off): first measure, then
 SNAP_MIN_RIDGE_FRAC = 0.4       # snap: ridge coverage (fraction of BEV depth) accepted as paint evidence
 EGO_AXIS_TOL_M = 0.8            # a lane is an ego candidate if the vehicle axis falls inside it, widened by this tolerance
 EDGE_SNAP_RIDGE_FRAC = 0.15     # edge clusters: the road mask already gives a prior, so less paint evidence is enough (~2 m)
-EGO_EDGE_HALF_W_M = 0.5         # half-width of the strips left/right of a line where ego_prob is compared
-EGO_EDGE_MIN_CONTRAST = 0.3     # min |mean ego_prob right - left| to trust the network over line_score
 
 RIDGE_REF_PCT = 99.9            # reference ridge strength: this percentile of the ridge image
 RIDGE_STRONG_FRAC = 0.3         # a z-bin counts as "on paint" if the ridge near the line exceeds this fraction of the reference
 RIDGE_HALF_W_M = 0.15           # half-width of the window around the line where the ridge is searched
 RIDGE_BONUS = 2.0               # score bonus per metre of line lying on a strong ridge
 
-COLOR_BONUS = 2.0               # score bonus per metre of line lying on the colour mask
+COLOR_BONUS = 3.0               # score bonus per metre of line lying on the colour mask
 EGO_EDGE_HALF_W_M = 0.5         # half-width of the strips left/right of a line where ego_prob is compared
 EGO_EDGE_MIN_CONTRAST = 0.3     # min |mean ego_prob right - left| for a z-bin to count as "on the ego-lane edge"
-EGO_EDGE_BONUS = 3.0            # score bonus per metre of line lying on an ego-lane edge (additive only)
+EGO_EDGE_BONUS = 2.0            # score bonus per metre of line lying on an ego-lane edge (additive only)
 EGO_PROB_MIN_PEAK = 0.5         # if the network never exceeds this, it sees no ego lane: no bonus at all
+EGO_PICK_MIN_FRAC = 0.5         # pick_cluster_line: a line within EGO_MASK_BAND_M of the UNet ego-mask border for this fraction of the BEV depth is eligible even if short (dashed paint)
+
+INSIDE_ROAD_MIN_FRAC = 0.95     # RANSAC line must lie on the dilated road mask for this fraction of the BEV depth (0.0 = filter off)
+INSIDE_ROAD_BAND_M = 0.2        # road-mask dilation used by the inclusion test
+EGO_MASK_THR = 0.5              # threshold on ego_prob to get the UNet ego-lane mask
+EGO_MASK_BAND_M = 0.2           # line within +-20 cm of the ego-mask border gets EGO_EDGE_BONUS
+POLY_PAINT_MIN_FRAC = 0.4       # boundary polyfit only if this fraction of z-bins has colour paint nearby (0.0 = gate off)
+POLY_PAINT_BAND_M = 0.5         # search band around the boundary for colour paint
+AVOID_PARKED = True              # pull the ego boundary in to the inner edge of parked vehicles
+PARKED_LABELS = {2, 3, 4, 6, 8}  # COCO: bicycle, car, motorcycle, bus, truck (pedestrians excluded)
+PARKED_CLEARANCE_M = 0.1         # boundary is placed this far from the vehicle inner edge, on the lane side
+VEHICLE_LEN_M = 4.5              # vehicles whose ground contact is this far before Z_RANGE[0] can still intrude in the BEV
+
+STRONG_SCORE_MIN = 100.0        # a selected painted boundary scoring above this anchors the lane
+SIM_SLOPE_TOL = 0.05            # max |dx/dz| difference vs the anchor over the BEV depth
+SIM_CURV_TOL = 0.05             # max |2c| difference vs the anchor [1/m]
+SIM_BONUS = 4.5                 # score bonus per metre of a candidate with similar slope/curvature
 
 # ---------------- curvature and prediction (ego lane) ----------------
 MIN_POLY_POINTS = 60            # min support points to fit a quadratic on a boundary
@@ -83,18 +99,40 @@ def cv2_color(name):
 LINE_COLORS = [cv2_color("magenta"), cv2_color("yellow"), cv2_color("blue")]
 
 
-# functions to detect vehicles on the road
 def vehicles_to_road(dets, M):
-    """Project bbox ground-contact points (bottom-left/centre/right) to road coords via the BEV homography."""
+    """Project bbox ground-contact points (shrunk left/centre/right + full left/right) to road coords via the BEV homography."""
     for d in dets:
         x1, y1, x2, y2 = d["box"]
         xc, hw = 0.5 * (x1 + x2), 0.5 * FOOT_SHRINK * (x2 - x1)
-        px = np.float32([[xc - hw, y2], [xc, y2], [xc + hw, y2]]).reshape(-1, 1, 2)
+        px = np.float32([[xc - hw, y2], [xc, y2], [xc + hw, y2], [x1, y2], [x2, y2]]).reshape(-1, 1, 2)
         bev = cv2.perspectiveTransform(px, M).reshape(-1, 2)
         x = X_RANGE[0] + bev[:, 0] / PX_PER_M
         z = Z_RANGE[1] - bev[:, 1] / PX_PER_M
-        d.update(x_l=float(x[0]), x_r=float(x[2]), z=float(z[1]))
+        d.update(x_l=float(x[0]), x_r=float(x[2]), z=float(z[1]), xf_l=float(x[3]), xf_r=float(x[4]))
     return dets
+
+def avoid_parked_vehicles(left, right, vehicles):
+    """
+    Translate an ego boundary in x so it does not run over a parked vehicle. 'Parked' = the whole vehicle footprint lies in
+    the outer half of the lane at its depth (the lead vehicle crosses the lane centre and is never used). The lane is never
+    narrowed below MIN_LANE_WIDTH_M. The boundary keeps its slope/curvature; support points are dropped so fit_boundary_poly
+    cannot re-fit the old position.
+    """
+    for v in vehicles:
+        z = v["z"]
+        if v["label"] not in PARKED_LABELS or not (Z_RANGE[0] - VEHICLE_LEN_M <= z <= Z_RANGE[1]):
+            continue
+        xl, xr = x_at(left, z), x_at(right, z)
+        mid = 0.5 * (xl + xr)
+        if mid < v["xf_l"] < xr:                       # vehicle in the right half of the lane
+            target = v["xf_l"] - PARKED_CLEARANCE_M
+            if target - xl >= MIN_LANE_WIDTH_M:
+                right = dict(right, b=right["b"] + target - xr, shifted=True, pts=None)
+        elif xl < v["xf_r"] < mid:                     # vehicle in the left half of the lane
+            target = v["xf_r"] + PARKED_CLEARANCE_M
+            if xr - target >= MIN_LANE_WIDTH_M:
+                left = dict(left, b=left["b"] + target - xl, shifted=True, pts=None)
+    return left, right
 
 
 def lead_vehicle(vehicles, left, right):
@@ -119,6 +157,17 @@ def line_gap(l1, l2, n=8):
     """Mean lateral distance between two lines over the BEV depth."""
     z = np.linspace(Z_RANGE[0], Z_RANGE[1], n)
     return float(np.mean(np.abs(x_at(l1, z) - x_at(l2, z))))
+
+
+def max_slope_diff(l1, l2, n=8):
+    """Max |dx/dz| difference between two lines over the BEV depth (handles the optional quadratic term)."""
+    z = np.linspace(Z_RANGE[0], Z_RANGE[1], n)
+    return float(np.max(np.abs(slope_at(l1, z) - slope_at(l2, z))))
+
+def similar_shape(c, ref):
+    """Same direction and curvature as ref: small slope difference over the BEV depth and small curvature difference."""
+    return (max_slope_diff(c, ref) <= SIM_SLOPE_TOL
+            and abs(2 * (c.get("c", 0.0) - ref.get("c", 0.0))) <= SIM_CURV_TOL)
 
 
 def has_paint_evidence(c, min_frac=SNAP_MIN_RIDGE_FRAC):
@@ -156,23 +205,36 @@ def ego_edge_contrast(c, ego_prob, half_w_m=EGO_EDGE_HALF_W_M):
     return float(abs(np.mean(right) - np.mean(left)))
 
 
+def inside_road_frac(c, road_dil):
+    """Fraction of the line (sampled per z-bin over the whole BEV depth) lying on road_dil. Bins outside the BEV width are ignored."""
+    h, w = road_dil.shape
+    z = np.arange(Z_RANGE[0] + COV_BIN_M / 2, Z_RANGE[1], COV_BIN_M)
+    rows = np.clip(((Z_RANGE[1] - z) * PX_PER_M).astype(int), 0, h - 1)
+    cols = np.floor((x_at(c, z) - X_RANGE[0]) * PX_PER_M).astype(int)
+    in_bev = (cols >= 0) & (cols < w)
+    if in_bev.sum() < 10:
+        return 0.0
+    return float(road_dil[rows[in_bev], cols[in_bev]].mean())
+
+
 def pick_cluster_line(group, ego_prob=None):
     """
-    Representative line of an interior cluster: the one with the sharpest ego_prob step among the lines
-    with enough depth coverage; if the network shows no clear step, the highest line_score (old behaviour).
+    Representative line of an interior cluster: among the eligible lines (long enough OR hugging the UNet ego-mask border,
+    so dashed paint is not penalised), the one that follows the ego-mask border the longest; if none follows it, the highest line_score.
     """
     best_score = max(group, key=line_score)
     if ego_prob is None:
         return best_score
     span = Z_RANGE[1] - Z_RANGE[0]
-    eligible = [c for c in group if c["cov_m"] >= NARROW_MIN_COV_FRAC * span]
+    eligible = [c for c in group
+                if c["cov_m"] >= NARROW_MIN_COV_FRAC * span or c.get("ego_m", 0.0) >= EGO_PICK_MIN_FRAC * span]
     if not eligible:
         return best_score
-    best = max(eligible, key=lambda c: ego_edge_contrast(c, ego_prob))
-    return best if ego_edge_contrast(best, ego_prob) >= EGO_EDGE_MIN_CONTRAST else best_score
+    best = max(eligible, key=lambda c: c.get("ego_m", 0.0))
+    return best if best.get("ego_m", 0.0) >= EGO_PICK_MIN_FRAC * span else best_score
 
 
-def select_boundaries(cands, left_edge, right_edge, ego_prob=None):
+def select_boundaries_once(cands, left_edge, right_edge, ego_prob=None):
     """
     One boundary per cluster of nearby lines:
     - cluster around a road edge: best painted line with ridge evidence, else the road edge itself;
@@ -187,7 +249,9 @@ def select_boundaries(cands, left_edge, right_edge, ego_prob=None):
     for e in edges:
         group = [c for c in pool if id(c) not in used and line_gap(c, e) < MERGE_DIST_M]
         used.update(id(c) for c in group)
-        painted = [c for c in group if line_gap(c, e) < SNAP_MAX_DIST_M and has_paint_evidence(c, EDGE_SNAP_RIDGE_FRAC)]
+        painted = [c for c in group if line_gap(c, e) < SNAP_MAX_DIST_M
+                    and max_slope_diff(c, e) <= SNAP_MAX_SLOPE_DIFF
+                    and has_paint_evidence(c, EDGE_SNAP_RIDGE_FRAC)]
         if painted:
             best = max(painted, key=line_score)
             keep.append(dict(best, edge=True, snapped=True, n_inl=int(best["inliers"].sum())))
@@ -204,7 +268,7 @@ def select_boundaries(cands, left_edge, right_edge, ego_prob=None):
         rest = [c for c in rest if x_at(c) > x_at(left_edge)]
     if right_edge:
         rest = [c for c in rest if x_at(c) < x_at(right_edge)]
-        winners = [pick_cluster_line(g, ego_prob) for g in cluster_by_gap(rest, MIN_LANE_WIDTH_M)]
+    winners = [pick_cluster_line(g, ego_prob) for g in cluster_by_gap(rest, MIN_LANE_WIDTH_M)]
     if winners:
         top = max(line_score(w) for w in winners)
         keep += [w for w in winners if line_score(w) >= INTERIOR_MIN_SCORE_FRAC * top]
@@ -217,6 +281,29 @@ def select_boundaries(cands, left_edge, right_edge, ego_prob=None):
         if len(keep) >= 3 and keep[-1].get("estimated") and not keep[-2].get("edge") and x_at(keep[-2], EGO_CHECK_Z_M) > 0:
             keep = keep[:-1]
     return keep
+
+
+def select_boundaries(cands, left_edge, right_edge, ego_prob=None):
+    """
+    Two passes. If a selected painted boundary scores above STRONG_SCORE_MIN, the candidates that could be its partner
+    (on the vehicle-axis side, MIN..MAX_LANE_WIDTH_M away) and have similar slope/curvature get SIM_BONUS per metre; then
+    the selection is rerun. The bonus only re-ranks lines that already pass the existing gates.
+    """
+    keep = select_boundaries_once(cands, left_edge, right_edge, ego_prob)
+    scored = [l for l in keep if "cov_m" in l]          # raw road edges have no score
+    if not scored:
+        return keep
+    anchor = max(scored, key=line_score)
+    if line_score(anchor) <= STRONG_SCORE_MIN:
+        return keep
+
+    xa = x_at(anchor, EGO_CHECK_Z_M)
+    side = -1.0 if xa > 0 else 1.0                      # the partner lies between the anchor and the vehicle axis
+    for c in cands:
+        partner = side * (x_at(c, EGO_CHECK_Z_M) - xa) > 0
+        gap_ok = MIN_LANE_WIDTH_M <= line_gap(c, anchor) <= MAX_LANE_WIDTH_M
+        c["sim_m"] = c["cov_m"] if (partner and gap_ok and similar_shape(c, anchor)) else 0.0
+    return select_boundaries_once(cands, left_edge, right_edge, ego_prob)
 
 
 def restrict_to_edges(pts_dict, edge_l, edge_r, band=EDGE_BAND_M):
@@ -379,25 +466,33 @@ def ridge_cov(c, grad, ref):
     return hit * COV_BIN_M
 
 
+def ego_mask_borders(ego_prob, thr=EGO_MASK_THR):
+    """Per-row left/right column of the UNet ego-lane mask (largest connected component). NaN on rows without mask."""
+    h, w = ego_prob.shape
+    left, right = np.full(h, np.nan), np.full(h, np.nan)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats((ego_prob > thr).astype(np.uint8), connectivity=8)
+    if n <= 1:
+        return left, right
+    comp = lab == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    rows = np.flatnonzero(comp.any(axis=1))
+    left[rows] = comp[rows].argmax(axis=1)
+    right[rows] = w - 1 - comp[rows, ::-1].argmax(axis=1)
+    return left, right
+
+
 def ego_edge_cov(c, ego_prob):
-    """Metres of the line where ego_prob steps sharply across it (ego-lane border). 0 if the network sees no ego lane."""
+    """Metres of the line lying within EGO_MASK_BAND_M of the left/right border of the UNet ego-lane mask. 0 if the network sees no ego lane."""
     if ego_prob is None or ego_prob.max() < EGO_PROB_MIN_PEAK:
         return 0.0
-    h, w = ego_prob.shape
+    left, right = ego_mask_borders(ego_prob)
+    h, _ = ego_prob.shape
     z = np.arange(Z_RANGE[0] + COV_BIN_M / 2, Z_RANGE[1], COV_BIN_M)
     rows = np.clip(((Z_RANGE[1] - z) * PX_PER_M).astype(int), 0, h - 1)
     cols = (x_at(c, z) - X_RANGE[0]) * PX_PER_M
-    d = int(round(EGO_EDGE_HALF_W_M * PX_PER_M))
-    hit = 0
-    for r, col in zip(rows, cols):
-        ci = int(col)
-        if ci - d < 0 or ci + d + 1 > w:
-            continue
-        left = ego_prob[r, ci - d:ci].mean()
-        right = ego_prob[r, ci + 1:ci + d + 1].mean()
-        if abs(right - left) >= EGO_EDGE_MIN_CONTRAST:
-            hit += 1
-    return hit * COV_BIN_M
+    tol = EGO_MASK_BAND_M * PX_PER_M
+    l, r = left[rows], right[rows]
+    near = ~np.isnan(l) & ((np.abs(cols - l) <= tol) | (np.abs(cols - r) <= tol))
+    return float(near.sum()) * COV_BIN_M
 
 
 def hypothesis_score(points, dist, threshold):
@@ -547,7 +642,9 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M, a_ref=
 
 
 def line_score(c):
-    return (c["cov_m"] + RIDGE_BONUS * c.get("ridge_m", 0.0) + COLOR_BONUS * c.get("color_m", 0.0) + TIGHT_BONUS * c.get("tight_m", 0.0) + EGO_EDGE_BONUS * c.get("ego_m", 0.0))
+    return (c["cov_m"] + RIDGE_BONUS * c.get("ridge_m", 0.0) + COLOR_BONUS * c.get("color_m", 0.0)
+            + TIGHT_BONUS * c.get("tight_m", 0.0) + EGO_EDGE_BONUS * c.get("ego_m", 0.0)
+            + SIM_BONUS * c.get("sim_m", 0.0))
 
 def filter_parallel(cands, edges):
     """Keep only candidate lines whose slope is close to the road edges or the dominant lane direction."""
@@ -640,13 +737,28 @@ def support_points(line, pts):
     return line.get("pts")
 
 
-def fit_boundary_poly(line, pts):
+def paint_support_frac(p, color_near):
+    """Fraction of the z-bins of the support points p (x, z) that have colour paint within the (pre-dilated) band."""
+    h, w = color_near.shape
+    row = np.clip(((Z_RANGE[1] - p[:, 1]) * PX_PER_M).astype(int), 0, h - 1)
+    col = np.floor((p[:, 0] - X_RANGE[0]) * PX_PER_M).astype(int)
+    ok = (col >= 0) & (col < w)
+    if not ok.any():
+        return 0.0
+    zb = np.floor((p[ok, 1] - Z_RANGE[0]) / COV_BIN_M).astype(int)
+    hit = color_near[row[ok], col[ok]] > 0
+    return len(np.unique(zb[hit])) / len(np.unique(zb))
+
+
+def fit_boundary_poly(line, pts, color_near=None):
     """Quadratic x = c*z^2 + a*z + b on a boundary's support points, accepted only if it clearly beats the straight fit."""
     straight = np.array([line.get("c", 0.0), line["a"], line["b"]])
     if line.get("inliers") is not None:
         return straight          # RANSAC candidate: its own model (line or parabola) was already chosen by ransac_best --------------- HERE
     p = support_points(line, pts)
     if p is None or len(p) < MIN_POLY_POINTS or np.ptp(p[:, 1]) < MIN_POLY_SPAN_FRAC * (Z_RANGE[1] - Z_RANGE[0]):
+        return straight
+    if color_near is not None and paint_support_frac(p, color_near) < POLY_PAINT_MIN_FRAC:
         return straight
 
     # one sample per z-bin: dense clusters must not dominate the fit
@@ -667,9 +779,9 @@ def fit_boundary_poly(line, pts):
     return np.array([c, a, b])
 
 
-def ego_centerline(ego, pts):
+def ego_centerline(ego, pts, color_near=None):
     """Centerline of the ego lane as x = c*z^2 + a*z + b (mean of the two boundary polynomials)."""
-    coeffs = 0.5 * (fit_boundary_poly(ego[0], pts) + fit_boundary_poly(ego[1], pts))
+    coeffs = 0.5 * (fit_boundary_poly(ego[0], pts, color_near) + fit_boundary_poly(ego[1], pts, color_near))
     return dict(c=float(coeffs[0]), a=float(coeffs[1]), b=float(coeffs[2]))
 
 
@@ -709,6 +821,10 @@ def lane_fitting(pipe, img, vehicles=()):
     pts_dict = restrict_to_edges(points_in_meters(pipe["thresh"]), edge_l, edge_r)
     pts = np.column_stack((pts_dict["x"], pts_dict["z"]))
     cands = find_candidates(pts, a_ref=a_ref)
+    if INSIDE_ROAD_MIN_FRAC > 0 and pipe["road"].any():
+        d = int(round(INSIDE_ROAD_BAND_M * PX_PER_M))
+        road_dil = cv2.dilate(pipe["road"].astype(np.uint8), np.ones((2 * d + 1, 2 * d + 1), np.uint8)) > 0
+        cands = [c for c in cands if inside_road_frac(c, road_dil) >= INSIDE_ROAD_MIN_FRAC]
     paint = (pipe["grad_thr"][pts_dict["row"], pts_dict["column"]] > 0) | (pipe["color"][pts_dict["row"], pts_dict["column"]] > 0)
     grad_ref = float(np.percentile(pipe["grad"][pipe["valid"]], RIDGE_REF_PCT))
     for c in cands:
@@ -723,14 +839,19 @@ def lane_fitting(pipe, img, vehicles=()):
     lanes = build_lanes(cands, edge_l, edge_r, pipe.get("ego_prob"))
     ego = next((ln for ln in lanes if ln[2]), None)
 
+    if ego and AVOID_PARKED:
+        ego[0], ego[1] = avoid_parked_vehicles(ego[0], ego[1], vehicles)
+
     out = dict(points=pts_dict, pts=pts, candidates=cands, edges=[e for e in (edge_l, edge_r) if e], lanes=lanes,
                 ransac_sx=ego[0] if ego else None, ransac_dx=ego[1] if ego else None)
     if ego:
-        center = ego_centerline(ego, pts)
+        d = int(round(POLY_PAINT_BAND_M * PX_PER_M))
+        color_near = cv2.dilate(pipe["color"], np.ones((1, 2 * d + 1), np.uint8))
+        center = ego_centerline(ego, pts, color_near)
         kappa, radius = curvature_at(center, Z_RANGE[0])
         target = lookahead_point(center)
         out.update(center=center, curvature=kappa, radius=radius, target=target)
-        curved = [[dict(zip("cab", fit_boundary_poly(l, pts))) for l in ego[:2]] + [True]]
+        curved = [[dict(zip("cab", fit_boundary_poly(l, pts, color_near))) for l in ego[:2]] + [True]]
         out["overlay"] = draw_lanes(img, pipe["M_inv"], curved)
         draw_prediction(out["overlay"], pipe["M_inv"], center, target)
         lead = lead_vehicle(vehicles, ego[0], ego[1])
@@ -809,7 +930,7 @@ def print_candidate_stats(out):
     """Print the numbers that decide snapping and lane selection."""
     for k, c in enumerate(out["candidates"]):
         print(f"cand {k}: x@mid={x_at(c):+.2f} a={c['a']:+.2f} cov={c['cov_m']:.1f}m "
-                f"paint={c['paint']:.2f} ridge={c['ridge_m']:.1f}m inl={int(c['inliers'].sum())} ego={c['ego_m']:.1f}m")
+                f"paint={c['paint']:.2f} ridge={c['ridge_m']:.1f}m inl={int(c['inliers'].sum())} ego={c['ego_m']:.1f}m sim={c.get('sim_m', 0.0):.1f}m score: {line_score(c):.2f} ")
     for l, r, _ in out["lanes"]:
         for name, ln in (("left", l), ("right", r)):
             print(f"ego {name}: x@mid={x_at(ln):+.2f} edge={ln.get('edge', False)} snapped={ln.get('snapped', False)}")
