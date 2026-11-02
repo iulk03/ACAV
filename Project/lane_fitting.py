@@ -54,6 +54,8 @@ RIDGE_STRONG_FRAC = 0.3         # a z-bin counts as "on paint" if the ridge near
 RIDGE_HALF_W_M = 0.15           # half-width of the window around the line where the ridge is searched
 RIDGE_BONUS = 2.0               # score bonus per metre of line lying on a strong ridge
 
+SLOPE_BONUS = 2.0               # score bonus per metre, scaled by how parallel the line is to the road edges
+
 COLOR_BONUS = 3.0               # score bonus per metre of line lying on the colour mask
 EGO_EDGE_HALF_W_M = 0.5         # half-width of the strips left/right of a line where ego_prob is compared
 EGO_EDGE_MIN_CONTRAST = 0.3     # min |mean ego_prob right - left| for a z-bin to count as "on the ego-lane edge"
@@ -190,6 +192,14 @@ def max_slope_diff(l1, l2, n=8):
     """Max |dx/dz| difference between two lines over the BEV depth (handles the optional quadratic term)."""
     z = np.linspace(Z_RANGE[0], Z_RANGE[1], n)
     return float(np.max(np.abs(slope_at(l1, z) - slope_at(l2, z))))
+
+
+def slope_match_m(c, a_ref):
+    """Covered length of c, scaled 0..1 by how close its slope is to the road-edge slope a_ref over the BEV depth."""
+    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 8)
+    diff = float(np.max(np.abs(slope_at(c, z) - a_ref)))
+    return c["cov_m"] * max(0.0, 1.0 - diff / SLOPE_TOL)
+
 
 def similar_shape(c, ref):
     """Same direction and curvature as ref: small slope difference over the BEV depth and small curvature difference."""
@@ -674,10 +684,11 @@ def line_score(c, prints=False):
                 f'COLOR_BONUS: {COLOR_BONUS * c.get("color_m", 0.0)}'
                 f'TIGHT_BONUS: {TIGHT_BONUS * c.get("tight_m", 0.0)}'
                 f'EGO_EDGE_BONUS: {EGO_EDGE_BONUS * c.get("ego_m", 0.0)}'
-                f'SIM_BONUS: {SIM_BONUS * c.get("sim_m", 0.0)}')
+                f'SIM_BONUS: {SIM_BONUS * c.get("sim_m", 0.0)}'
+                f'SLOPE_BONUS: {SLOPE_BONUS * c.get("slope_m", 0.0)}')
     return (c["cov_m"] + RIDGE_BONUS * c.get("ridge_m", 0.0) + COLOR_BONUS * c.get("color_m", 0.0)
             + TIGHT_BONUS * c.get("tight_m", 0.0) + EGO_EDGE_BONUS * c.get("ego_m", 0.0)
-            + SIM_BONUS * c.get("sim_m", 0.0))
+            + SIM_BONUS * c.get("sim_m", 0.0) + SLOPE_BONUS * c.get("slope_m", 0.0))
 
 def filter_parallel(cands, edges):
     """Keep only candidate lines whose slope is close to the road edges or the dominant lane direction."""
@@ -872,6 +883,7 @@ def lane_fitting(pipe, img, vehicles=()):
         tight = line_distance(pts, c["a"], c["b"], c.get("c", 0.0)) <= TIGHT_THRESHOLD_M
         c["tight_m"] = coverage(pts, tight) * COV_BIN_M
         c["ego_m"] = ego_edge_cov(c, pipe.get("ego_prob"))
+        c["slope_m"] = slope_match_m(c, a_ref)
 
     lanes = build_lanes(cands, edge_l, edge_r, pipe.get("ego_prob"))
     ego = next((ln for ln in lanes if ln[2]), None)

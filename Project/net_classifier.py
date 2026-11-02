@@ -303,9 +303,10 @@ _net = None
 def load_net():
     global _net
     if _net is None:
-        _net = UNetR18(pretrained=False).to(DEVICE)
-        _net.load_state_dict(torch.load(NET_PATH, map_location=DEVICE))
-        _net.eval()
+        net = UNetR18(pretrained=False)
+        state = torch.load(NET_PATH, map_location="cpu", weights_only=True)
+        net.load_state_dict(state)
+        _net = net.to(DEVICE).eval()
     return _net
 
 

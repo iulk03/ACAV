@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ROOT = BASE_DIR / "data_road"
 OUT_DIR = BASE_DIR / "debug_images"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-OPTIONS = {'um':94, 'umm':95, 'uu':97}
+OPTIONS = {'um':95, 'umm':96, 'uu':98}
 
 # delete previously generated images
 for file_path in OUT_DIR.iterdir():
@@ -22,9 +22,9 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # number --> one image
 # None   --> all the images of the specificied type
 # 'w'    --> only wrongly detected images
-SINGLE = 87
+SINGLE = None
 TYPE = 0 # 0 = um, 1 = umm, 2 = uu
-ALL = True # True to process all the images (um, umm, uu)
+ALL = False # True to process all the images (um, umm, uu)
 
 wrong = {'um': [], 
         'umm': [8, 12, 22, 23, 24, 25, 42, 52, 71, 82, 90], 
@@ -67,3 +67,7 @@ else:
             execute(idx, type)
     else:
         execute(SINGLE, type)
+
+
+
+# TODO: provare a raddrizzare l'immagine e 
