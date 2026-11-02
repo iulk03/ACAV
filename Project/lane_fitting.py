@@ -2,7 +2,10 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
-from lane_pipeline import X_RANGE, Z_RANGE, PX_PER_M
+
+X_RANGE = (-7.0, 7.0)       # road width in metres
+Z_RANGE = (6.5, 20.0)       # road depth in metres
+PX_PER_M = 30               # bird-eye view resolution (1 px = 1/30 m)
 
 # ---------------- RANSAC parameters ----------------
 MARGIN_PX = 6                   # ignore pixels too close to the image border

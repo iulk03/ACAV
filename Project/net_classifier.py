@@ -1,4 +1,3 @@
-# road_net.py
 """
 Pixel-wise road / non-road segmentation in the bird-eye view with a small U-Net (ResNet18 encoder).
 Output saved in road_net.pt file.
@@ -26,9 +25,19 @@ SEED = 0
 import torch
 
 def pick_device():
-    if torch.cuda.is_available():
+    import os
+    forced = os.environ.get("FORCE_DEVICE")          # e.g. FORCE_DEVICE=cpu to bypass any backend
+    if forced:
+        return torch.device(forced)
+    if torch.cuda.is_available():                    # 1) CUDA always has priority
         return torch.device("cuda")
-    if hasattr(torch, "xpu") and torch.xpu.is_available():
+    try:                                             # 2) DirectML only if CUDA is not available
+        import torch_directml
+        if torch_directml.device_count() > 0:
+            return torch_directml.device()
+    except ImportError:
+        pass
+    if hasattr(torch, "xpu") and torch.xpu.is_available():   # 3) Intel XPU
         return torch.device("xpu")
     return torch.device("cpu")
 
@@ -150,7 +159,7 @@ def to_tensor(bev_rgb):
 
 def masked_dice_bce(logits, target, valid):
     """BCE + Dice on the valid pixels. A sample with an all-False mask contributes zero loss."""
-    bce = nn.functional.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    bce = logits.clamp(min=0) - logits * target + torch.log1p(torch.exp(-logits.abs()))
     bce = (bce * valid).sum() / valid.sum().clamp(min=1)
     p = torch.sigmoid(logits) * valid
     t = target * valid
