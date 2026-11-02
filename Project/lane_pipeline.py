@@ -73,18 +73,20 @@ def canny_bev_pipeline(img_bev):
     edges_filtered = cv2.bitwise_and(canny_out, vert_mask)
     return edges_filtered
 
-def lane_pipeline(path, img):
+
+def lane_pipeline(path, img, out_path=None):
     calib = read_calib(path)
     trapezoid = compute_trapezoid(calib)
     img_roi = apply_roi(img, trapezoid)
     img_bird_eye, M, M_inv = brid_eye_view(img_roi, trapezoid)
-    
+
     img_thresh = canny_bev_pipeline(img_bird_eye)
-    
-    print_images(img, img_bird_eye, img_thresh, trapezoid)
+
+    print_images(img, img_bird_eye, img_thresh, trapezoid, out_path)
     return M_inv, img_thresh
 
-def print_images(img, img_bird_eye, img_thresh, trapezoid):
+
+def print_images(img, img_bird_eye, img_thresh, trapezoid, out_path=None):
     vis = img.copy()
     cv2.polylines(vis, [trapezoid.astype("int32")], True, (255, 0, 0), 3)
     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
@@ -94,4 +96,8 @@ def print_images(img, img_bird_eye, img_thresh, trapezoid):
     for a in ax:
         a.axis("off")
     plt.tight_layout()
-    plt.show()
+    if out_path is not None:
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+    else:
+        plt.show()

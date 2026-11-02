@@ -35,6 +35,10 @@ def smooth_line(current_line, prev_line, alpha=0.6):
     smoothed["b"] = alpha * current_line["b"] + (1 - alpha) * prev_line["b"]
     return smoothed
 
+def reset_tracking():
+    """Clear temporal smoothing state (call between unrelated images)."""
+    global prev_left_line, prev_right_line
+    prev_left_line = prev_right_line = None
 
 # ---------------- da immagine binaria a coordinate strada ----------------
 def points_in_meters(img_tresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_RANGE, margin_px=MARGIN_PX):
@@ -216,7 +220,7 @@ def lane_fitting(img_tresh, img, M_inv):
 
 
 # ---------------- funzione di debug visivo BEV ----------------
-def plot_bev_debug(img_tresh, fitting_out):
+def plot_bev_debug(img_tresh, fitting_out, out_path=None):
     fig, ax = plt.subplots(figsize=(7, 8))
     ax.imshow(
         img_tresh,
@@ -258,4 +262,20 @@ def plot_bev_debug(img_tresh, fitting_out):
     ax.grid(alpha=0.2)
     ax.legend(loc="upper right")
     fig.tight_layout()
-    plt.show()
+
+    if out_path is not None:
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+
+def print_candidate_stats(out):
+    """Print the numbers that decide snapping and lane selection."""
+    for k, c in enumerate(out["candidates"]):
+        print(f"cand {k}: x@mid={x_at(c):+.2f} a={c['a']:+.2f} cov={c['cov_m']:.1f}m "
+                f"paint={c['paint']:.2f} ridge={c['ridge_m']:.1f}m inl={int(c['inliers'].sum())} ego={c['ego_m']:.1f}m sim={c.get('sim_m', 0.0):.1f}m score: {line_score(c, True):.2f} ")
+    for l, r, _ in out["lanes"]:
+        for name, ln in (("left", l), ("right", r)):
+            print(f"ego {name}: x@mid={x_at(ln):+.2f} edge={ln.get('edge', False)} snapped={ln.get('snapped', False)}")
