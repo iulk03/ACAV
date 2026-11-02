@@ -3,23 +3,37 @@ import numpy as np
 import cv2
 from lane_pipeline import X_RANGE, Z_RANGE, PX_PER_M
 
-# ---------------- parametri RANSAC ----------------
+# ---------------- parametri RANSAC (Ottimizzati per Canny) ----------------
 MARGIN_PX = 6               # esclude i pixel troppo vicini ai bordi
-INLINER_TRESHOLD_M = 0.20   # distanza massima per essere inlier
-MIN_SEPARATION_M = 4.0      # distanza minima in z tra i due punti che definiscono una retta
-SUCCESS_PROBABILITY = 0.99
-MAX_ITER = 500
-MIN_INLIERS = 50
-MAX_SLOPE = 0.5             # pendenza massima di una singola retta (x = a*z + b)
+INLINER_TRESHOLD_M = 0.12   # soglia in metri per essere inlier
+MIN_SEPARATION_M = 4.0      # distanza minima in z tra i due punti
+SUCCESS_PROBABILITY = 0.99  #
+MAX_ITER = 500              #
+MIN_INLIERS = 25            # ridotto per adattarsi al bordo Canny a 1 pixel
+MAX_SLOPE = 0.5             # pendenza massima (x = a*z + b)
 
 # ---------------- parametri di scelta della coppia ----------------
-N_CANDIDATES = 5            # quante rette candidate cercare (ogni linea bianca ha 2 bordi)
-Z_REF = 0.5 * (Z_RANGE[0] + Z_RANGE[1])   # z a cui si misura la posizione laterale (dentro il range)
+N_CANDIDATES = 5            # quante rette candidate cercare
+Z_REF = 0.5 * (Z_RANGE[0] + Z_RANGE[1])   # z di riferimento per la posizione laterale
 LANE_W_MIN = 2.5            # larghezza minima plausibile della corsia (m)
 LANE_W_MAX = 4.5            # larghezza massima plausibile (m)
 SLOPE_DELTA_MAX = 0.1       # differenza massima di pendenza tra le due rette
-W_CENTER = 100.0            # peso della penalita' "auto lontana dal centro della coppia" (in pixel/metro)
-LANE_WIDTH_M = 3.2          # larghezza di default per il ripiego (un solo lato trovato)
+W_CENTER = 100.0            # peso della penalità centro auto
+LANE_WIDTH_M = 3.2          # larghezza di default per il ripiego
+
+# Memoria per lo smoothing temporale
+prev_left_line = None
+prev_right_line = None
+
+
+def smooth_line(current_line, prev_line, alpha=0.6):
+    """Filtro esponenziale per evitare scatti visivi tra frame successivi."""
+    if prev_line is None or current_line is None:
+        return current_line
+    smoothed = dict(current_line)
+    smoothed["a"] = alpha * current_line["a"] + (1 - alpha) * prev_line["a"]
+    smoothed["b"] = alpha * current_line["b"] + (1 - alpha) * prev_line["b"]
+    return smoothed
 
 
 # ---------------- da immagine binaria a coordinate strada ----------------
@@ -91,16 +105,10 @@ def ransac(points, threshold=INLINER_TRESHOLD_M, min_inliers=MIN_INLIERS, max_it
 
 # ---------------- candidati multipli e scelta della coppia ----------------
 def x_at(line, z=Z_REF):
-    """Posizione laterale della retta a una z dentro il range (non a z = 0, che e' estrapolata)."""
     return line["a"] * z + line["b"]
 
 
 def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
-    """
-    RANSAC sequenziale su TUTTI i punti: trova la retta migliore, rimuove i punti vicini
-    (banda 2*threshold, cosi' non ripesca l'altro bordo della stessa linea), e ripete.
-    La maschera 'inliers' di ogni candidato e' riferita all'array originale.
-    """
     cands = []
     remaining = np.arange(len(points))
     for _ in range(n):
@@ -120,14 +128,13 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
 
 
 def pair_score(l, r):
-    """Punteggio di una coppia (sinistra, destra). -inf se non e' una corsia plausibile."""
     larg = x_at(r) - x_at(l)
     if not (LANE_W_MIN < larg < LANE_W_MAX):
         return -np.inf
     if abs(l["a"] - r["a"]) > SLOPE_DELTA_MAX:
         return -np.inf
     centro = 0.5 * (x_at(l) + x_at(r))
-    penalita = W_CENTER * abs(centro)   # morbida: un cambio corsia puo' ancora vincere
+    penalita = W_CENTER * abs(centro)
     return int(l["inliers"].sum()) + int(r["inliers"].sum()) - penalita
 
 
@@ -144,19 +151,15 @@ def best_pair(cands):
 
 
 def missing_side(line, width=LANE_WIDTH_M):
-    """
-    Ripiego: una sola retta affidabile. Se sta a destra del centro e' il bordo destro,
-    altrimenti il sinistro. L'altro lato e' STIMATO (stessa pendenza, spostato di 'width').
-    """
     est = dict(a=line["a"], b=None, inliers=None, n_iter=0, stimata=True)
     if x_at(line) > 0:
         est["b"] = line["b"] - width
-        return est, line          # (sinistra stimata, destra misurata)
+        return est, line
     est["b"] = line["b"] + width
-    return line, est              # (sinistra misurata, destra stimata)
+    return line, est
 
 
-# ---------------- disegno ----------------
+# ---------------- disegno e prospettiva ----------------
 def line_on_image(line, M_inv, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
     a, b = line["a"], line["b"]
     z = np.linspace(z_range[0], z_range[1], 100)
@@ -179,10 +182,12 @@ def draw_line(img, M_inv, line_lft, line_rgt, alpha=0.35):
     return out
 
 
-# ---------------- funzione principale ----------------
+# ---------------- funzione principale di fitting ----------------
 def lane_fitting(img_tresh, img, M_inv):
+    global prev_left_line, prev_right_line
+
     pts_dict = points_in_meters(img_tresh)
-    pts = np.column_stack((pts_dict["x"], pts_dict["z"]))   # una riga per punto: (x, z)
+    pts = np.column_stack((pts_dict["x"], pts_dict["z"]))
 
     cands = find_candidates(pts)
     pair = best_pair(cands)
@@ -192,10 +197,16 @@ def lane_fitting(img_tresh, img, M_inv):
     if pair is not None:
         ransac_sx, ransac_dx = pair
     elif cands:
-        # nessuna coppia plausibile: tengo la retta con piu' inlier e stimo l'altro lato
         best = max(cands, key=lambda c: int(c["inliers"].sum()))
         ransac_sx, ransac_dx = missing_side(best)
         stimata = True
+
+    # Smoothing temporale
+    ransac_sx = smooth_line(ransac_sx, prev_left_line)
+    ransac_dx = smooth_line(ransac_dx, prev_right_line)
+
+    prev_left_line = ransac_sx
+    prev_right_line = ransac_dx
 
     out = dict(points=pts_dict, pts=pts, candidates=cands,
                ransac_sx=ransac_sx, ransac_dx=ransac_dx, stimata=stimata)
@@ -204,6 +215,7 @@ def lane_fitting(img_tresh, img, M_inv):
     return out
 
 
+# ---------------- funzione di debug visivo BEV ----------------
 def plot_bev_debug(img_tresh, fitting_out):
     fig, ax = plt.subplots(figsize=(7, 8))
     ax.imshow(
@@ -226,11 +238,10 @@ def plot_bev_debug(img_tresh, fitting_out):
             inl = pts[line["inliers"]]
             ax.scatter(inl[:, 0], inl[:, 1], s=5, color=color,
                        label=f"Inlier {label.lower()} ({len(inl)})")
-            z_values = np.linspace(inl[:, 1].min(), inl[:, 1].max(), 100)
+            z_values = np.linspace(inl[:, 1].min(), inl[:, 1].max(), 100) if len(inl) > 0 else np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
             style = "-"
             name = f"Retta {label.lower()}"
         else:
-            # lato stimato dalla larghezza di default: tratteggiato su tutto il range
             z_values = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
             style = "--"
             name = f"Retta {label.lower()} (STIMATA)"
@@ -240,7 +251,7 @@ def plot_bev_debug(img_tresh, fitting_out):
     ax.set(
         xlabel="x laterale (m)",
         ylabel="z in avanti (m)",
-        title="Bird-Eye View: pixel candidati e inlier RANSAC",
+        title="Bird-Eye View: pixel candidati e inlier RANSAC (Canny)",
         xlim=X_RANGE,
         ylim=Z_RANGE,
     )
