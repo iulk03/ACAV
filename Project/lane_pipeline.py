@@ -61,7 +61,7 @@ def valid_bev_mask(img_shape, M, size):
     return cv2.warpPerspective(ones, M, size, flags=cv2.INTER_NEAREST) > 0
 
 
-def widen_mask(mask, valid_bev, px=3, margin=6):
+def widen_mask(mask, valid_bev, px=1, margin=6):
     """Dilate a 0/255 mask by px pixels, without leaking into the black area outside the original image."""
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * px + 1, 2 * px + 1))
     out = cv2.dilate(mask, k)

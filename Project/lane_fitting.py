@@ -15,37 +15,21 @@ MAX_SLOPE = 0.5             # pendenza massima (x = a*z + b)
 # ---------------- parametri di scelta della coppia ----------------
 N_CANDIDATES = 5            # quante rette candidate cercare
 Z_REF = 0.5 * (Z_RANGE[0] + Z_RANGE[1])   # z di riferimento per la posizione laterale
-LANE_W_MIN = 2.5            # larghezza minima plausibile della corsia (m)
-LANE_W_MAX = 4.5            # larghezza massima plausibile (m)
+LANE_W_MIN = 2.0            # larghezza minima plausibile della corsia (m)
+LANE_W_MAX = 5.5            # max plausible lane width (m): wide intersections
 SLOPE_DELTA_MAX = 0.1       # differenza massima di pendenza tra le due rette
-W_CENTER = 100.0            # peso della penalità centro auto
+W_CENTER = 20.0             # weak penalty for a lane not centred on the car
+W_WIDTH = 40.0              # penalty per metre away from LANE_WIDTH_M
 LANE_WIDTH_M = 3.2          # larghezza di default per il ripiego
 MASK_EDGE_MARGIN_PX = 4     # border columns closer than this to the BEV side are fake (clipped by the ROI)
 MASK_MIN_ROWS = 40          # min number of rows with a valid border point
 
-LANE_W_MAX = 5.5            # max plausible lane width (m): wide intersections
-W_CENTER = 20.0             # weak penalty for a lane not centred on the car
-W_OUTSIDE = 100.0           # penalty per metre by which the car (x=0) lies outside the lane
-W_WIDTH = 40.0              # penalty per metre away from LANE_WIDTH_M
 
-# Memoria per lo smoothing temporale
-prev_left_line = None
-prev_right_line = None
+CAR_TOL_M = 0.3             # car (x=0) must lie between the two lines, within this tolerance
+W_SUPPORT_CAP = 400.0       # cap on the weighted inlier support of a single line
+W_GUIDE = 80.0              # penalty per metre of disagreement with the guide border (lane guide only)
+GUIDE_TOL_M = 0.6           # max distance for a candidate to be considered "matching" a guide border
 
-
-def smooth_line(current_line, prev_line, alpha=0.6):
-    """Filtro esponenziale per evitare scatti visivi tra frame successivi."""
-    if prev_line is None or current_line is None:
-        return current_line
-    smoothed = dict(current_line)
-    smoothed["a"] = alpha * current_line["a"] + (1 - alpha) * prev_line["a"]
-    smoothed["b"] = alpha * current_line["b"] + (1 - alpha) * prev_line["b"]
-    return smoothed
-
-def reset_tracking():
-    """Clear temporal smoothing state (call between unrelated images)."""
-    global prev_left_line, prev_right_line
-    prev_left_line = prev_right_line = None
 
 # ---------------- da immagine binaria a coordinate strada ----------------
 def points_in_meters(img_tresh, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_RANGE, margin_px=MARGIN_PX):
@@ -83,8 +67,7 @@ def line_fit(p1, p2, separation=MIN_SEPARATION_M, max_slope=MAX_SLOPE):
     return a, x1 - a * z1
 
 
-def ransac(points, threshold=INLINER_TRESHOLD_M, min_inliers=MIN_INLIERS, max_iter=MAX_ITER,
-           p=SUCCESS_PROBABILITY, max_slope=MAX_SLOPE, sep_min=MIN_SEPARATION_M, seed=0):
+def ransac(points, threshold=INLINER_TRESHOLD_M, min_inliers=MIN_INLIERS, max_iter=MAX_ITER, p=SUCCESS_PROBABILITY, max_slope=MAX_SLOPE, sep_min=MIN_SEPARATION_M, seed=0):
     N = len(points)
     if N < max(2, min_inliers):
         return None
@@ -119,6 +102,11 @@ def x_at(line, z=Z_REF):
     return line["a"] * z + line["b"]
 
 
+def x_car(line):
+    """Lateral position of the line at z=0 (where the car is), not at Z_REF: matters when the camera is yawed."""
+    return line["b"]
+
+
 def near_weights(pts):
     """Per-point weight: `gain` at the closest z, linearly down to 1.0 at the farthest z."""
     t = (Z_RANGE[1] - pts[:, 1]) / (Z_RANGE[1] - Z_RANGE[0])      # 1 near the camera, 0 far
@@ -146,28 +134,46 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
     return cands
 
 
-def pair_score(l, r):
+def pair_score(l, r, gl=None, gr=None):
     xl, xr = x_at(l), x_at(r)
-    larg = xr - xl
+    larg = xr - xl                                     # width: same at any z for ~parallel lines
     if not (LANE_W_MIN < larg < LANE_W_MAX):
         return -np.inf
     if abs(l["a"] - r["a"]) > SLOPE_DELTA_MAX:
         return -np.inf
-    outside = max(0.0, xl, -xr)            # 0 if the car is between the two lines
-    penalty = W_OUTSIDE * outside + W_CENTER * abs(0.5 * (xl + xr)) + W_WIDTH * abs(larg - LANE_WIDTH_M)
-    return l["w_inl"] + r["w_inl"] - penalty
+    cl, cr = x_car(l), x_car(r)                        
+    if not (cl < CAR_TOL_M and cr > -CAR_TOL_M):
+        return -np.inf
+    support = min(l["w_inl"], W_SUPPORT_CAP) + min(r["w_inl"], W_SUPPORT_CAP)
+    penalty = W_CENTER * abs(0.5 * (cl + cr)) + W_WIDTH * abs(larg - LANE_WIDTH_M)
+    if gl is not None:
+        penalty += W_GUIDE * abs(xl - x_at(gl))
+    if gr is not None:
+        penalty += W_GUIDE * abs(xr - x_at(gr))
+    return support - penalty
 
 
-def best_pair(cands):
+def best_pair(cands, gl=None, gr=None):
     best, best_s = None, -np.inf
     for l in cands:
         for r in cands:
             if l is r or x_at(l) >= x_at(r):
                 continue
-            s = pair_score(l, r)
+            s = pair_score(l, r, gl, gr)
             if s > best_s:
                 best, best_s = (l, r), s
     return best
+
+
+def pick_anchor(cands, gl, gr):
+    """Candidate used when no valid pair exists: the one closest to a guide border, else the strongest."""
+    refs = [g for g in (gl, gr) if g is not None]
+    if refs:
+        scored = [(min(abs(x_at(c) - x_at(g)) for g in refs), c) for c in cands]
+        scored = [t for t in scored if t[0] < GUIDE_TOL_M]
+        if scored:
+            return min(scored, key=lambda t: t[0])[1]
+    return max(cands, key=lambda c: c["w_inl"])
 
 
 def missing_side(line, width=LANE_WIDTH_M):
@@ -193,6 +199,13 @@ def mask_border_line(mask, side, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_R
     if len(pts) < MASK_MIN_ROWS:
         return None
     return ransac(np.array(pts), min_inliers=MASK_MIN_ROWS)
+
+
+def guide_borders(guide):
+    """(left, right) border lines of the guide mask. Only if the guide is the ego-lane mask, else (None, None)."""
+    if guide is None or guide.get("mask") is None or guide.get("source") != "lane":
+        return None, None
+    return mask_border_line(guide["mask"], "left"), mask_border_line(guide["mask"], "right")
 
 
 def missing_side_from_guide(line, guide):
@@ -239,13 +252,13 @@ def draw_line(img, M_inv, line_lft, line_rgt, alpha=0.35):
 
 # ---------------- funzione principale di fitting ----------------
 def lane_fitting(img_tresh, img, M_inv, guide=None):
-    global prev_left_line, prev_right_line
 
     pts_dict = points_in_meters(img_tresh)
     pts = np.column_stack((pts_dict["x"], pts_dict["z"]))
 
+    gl, gr = guide_borders(guide)
     cands = find_candidates(pts)
-    pair = best_pair(cands)
+    pair = best_pair(cands, gl, gr)
 
     ransac_sx = ransac_dx = None
     stimata = False
@@ -254,16 +267,10 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
         ransac_sx, ransac_dx = pair
         sel = dict(left=_index(cands, pair[0]), right=_index(cands, pair[1]))
     elif cands:
-        best = max(cands, key=lambda c: c["w_inl"])
+        best = pick_anchor(cands, gl, gr)
         ransac_sx, ransac_dx = missing_side_from_guide(best, guide) or missing_side(best)
         sel["right" if x_at(best) > 0 else "left"] = _index(cands, best)
         stimata = True
-    # Smoothing temporale
-    ransac_sx = smooth_line(ransac_sx, prev_left_line)
-    ransac_dx = smooth_line(ransac_dx, prev_right_line)
-
-    prev_left_line = ransac_sx
-    prev_right_line = ransac_dx
 
     out = dict(points=pts_dict, pts=pts, candidates=cands, ransac_sx=ransac_sx, ransac_dx=ransac_dx, stimata=stimata, sel=sel, guide=guide)
     if ransac_sx and ransac_dx:
@@ -415,52 +422,3 @@ def plot_candidates_image(img, out, M_inv, out_path=None):
         plt.close(fig)
     else:
         plt.show()
-
-
-def plot_candidates_bev(out, guide, out_path=None):                                                             #UNUSED
-    """BEV image + guide mask contour + every RANSAC candidate in its own colour (legend: #index)."""
-    cmap = plt.get_cmap("tab10")
-    ext = (X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1])
-    fig, ax = plt.subplots(figsize=(8, 8))
-    if guide is not None and guide.get("bev") is not None:
-        ax.imshow(guide["bev"], origin="upper", extent=ext, aspect="auto")
-        if guide.get("mask") is not None:
-            ax.contour((guide["mask"] > 0).astype(float), levels=[0.5], colors="white", linewidths=1.5, extent=ext, origin="upper")
-            ax.plot([], [], color="white", label=f"guide mask ({guide['source']})")
-
-    pts = out["pts"]
-    role = {v: k for k, v in out["sel"].items() if v is not None}
-    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
-    for k, c in enumerate(out["candidates"]):
-        col = cmap(k % 10)
-        inl = pts[c["inliers"]]
-        ax.scatter(inl[:, 0], inl[:, 1], s=6, color=col)
-        ax.plot(c["a"] * z + c["b"], z, color=col, linewidth=1.5)
-        tag = f"  -> {role[k].upper()}" if k in role else ""
-        ax.plot([], [], color=col, marker="o",
-                label=f"#{k} x@mid={x_at(c):+.2f} a={c['a']:+.2f} n={int(c['inliers'].sum())}{tag}")
-
-    for key in ("ransac_sx", "ransac_dx"):
-        l = out[key]
-        if l is not None and l.get("inliers") is None:
-            ax.plot(l["a"] * z + l["b"], z, "--", color="black", linewidth=2,
-                    label=f"estimated ({l.get('source', 'default')})")
-
-    ax.set(xlim=X_RANGE, ylim=Z_RANGE, xlabel="x lateral (m)", ylabel="z forward (m)", title="RANSAC candidates on the BEV")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
-    fig.tight_layout()
-    if out_path is not None:
-        fig.savefig(out_path, dpi=120)
-        plt.close(fig)
-    else:
-        plt.show()
-
-
-def print_candidate_stats(out):
-    """Print the numbers that decide snapping and lane selection."""
-    for k, c in enumerate(out["candidates"]):
-        print(f"cand {k}: x@mid={x_at(c):+.2f} a={c['a']:+.2f} cov={c['cov_m']:.1f}m "
-                f"paint={c['paint']:.2f} ridge={c['ridge_m']:.1f}m inl={int(c['inliers'].sum())} ego={c['ego_m']:.1f}m sim={c.get('sim_m', 0.0):.1f}m score: {line_score(c, True):.2f} ")
-    for l, r, _ in out["lanes"]:
-        for name, ln in (("left", l), ("right", r)):
-            print(f"ego {name}: x@mid={x_at(ln):+.2f} edge={ln.get('edge', False)} snapped={ln.get('snapped', False)}")
