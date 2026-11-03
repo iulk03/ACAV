@@ -24,7 +24,7 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # number --> one image
 # None   --> all the images of the specificied type
 # 'w'    --> only wrongly detected images
-SINGLE = 'w'
+SINGLE = None
 TYPE = 0 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 
@@ -43,7 +43,8 @@ def execute(img_idx, img_type):
     M_inv, thresh, guide = lp.lane_pipeline(calib_path, img, out_path=OUT_DIR / f"{stem}_bev.png")
     out = lf.lane_fitting(thresh, img, M_inv, guide)
     lf.plot_bev_debug(thresh, out, OUT_DIR / f"{stem}_candidates.png")
-    lf.plot_candidates_bev(out, guide, OUT_DIR / f"{stem}_cands_bev.png")
+    lf.plot_candidates_thresh(thresh, out, OUT_DIR / f"{stem}_cands_thresh.png")
+    lf.plot_candidates_image(img, out, M_inv, OUT_DIR / f"{stem}_cands_img.png")
 
     if "overlay" in out:
         cv2.imwrite(str(OUT_DIR / f"{stem}_overlay.png"), cv2.cvtColor(out["overlay"], cv2.COLOR_RGB2BGR))

@@ -119,8 +119,15 @@ def x_at(line, z=Z_REF):
     return line["a"] * z + line["b"]
 
 
+def near_weights(pts):
+    """Per-point weight: `gain` at the closest z, linearly down to 1.0 at the farthest z."""
+    t = (Z_RANGE[1] - pts[:, 1]) / (Z_RANGE[1] - Z_RANGE[0])      # 1 near the camera, 0 far
+    return 1.0 + 2.0 * np.clip(t, 0.0, 1.0)
+
+
 def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
     cands = []
+    w = near_weights(points)
     remaining = np.arange(len(points))
     for _ in range(n):
         if len(remaining) < MIN_INLIERS:
@@ -132,6 +139,7 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
         full_mask = np.zeros(len(points), dtype=bool)
         full_mask[remaining[r["inliers"]]] = True
         r["inliers"] = full_mask
+        r["w_inl"] = float(w[full_mask].sum())
         cands.append(r)
         near = line_distance(sub, r["a"], r["b"]) <= 2 * threshold
         remaining = remaining[~near]
@@ -147,7 +155,7 @@ def pair_score(l, r):
         return -np.inf
     outside = max(0.0, xl, -xr)            # 0 if the car is between the two lines
     penalty = W_OUTSIDE * outside + W_CENTER * abs(0.5 * (xl + xr)) + W_WIDTH * abs(larg - LANE_WIDTH_M)
-    return int(l["inliers"].sum()) + int(r["inliers"].sum()) - penalty
+    return l["w_inl"] + r["w_inl"] - penalty
 
 
 def best_pair(cands):
@@ -246,7 +254,7 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
         ransac_sx, ransac_dx = pair
         sel = dict(left=_index(cands, pair[0]), right=_index(cands, pair[1]))
     elif cands:
-        best = max(cands, key=lambda c: int(c["inliers"].sum()))
+        best = max(cands, key=lambda c: c["w_inl"])
         ransac_sx, ransac_dx = missing_side_from_guide(best, guide) or missing_side(best)
         sel["right" if x_at(best) > 0 else "left"] = _index(cands, best)
         stimata = True
@@ -284,8 +292,7 @@ def plot_bev_debug(img_tresh, fitting_out, out_path=None):
 
         if line.get("inliers") is not None:
             inl = pts[line["inliers"]]
-            ax.scatter(inl[:, 0], inl[:, 1], s=5, color=color,
-                       label=f"Inlier {label.lower()} ({len(inl)})")
+            ax.scatter(inl[:, 0], inl[:, 1], s=5, color=color, label=f"Inlier {label.lower()} ({len(inl)})")
             z_values = np.linspace(inl[:, 1].min(), inl[:, 1].max(), 100) if len(inl) > 0 else np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
             style = "-"
             name = f"Retta {label.lower()}"
@@ -314,7 +321,103 @@ def plot_bev_debug(img_tresh, fitting_out, out_path=None):
         plt.show()
 
 
-def plot_candidates_bev(out, guide, out_path=None):
+def plot_candidates_thresh(img_tresh, out, out_path=None):
+    """Same look as plot_bev_debug (black thresh image, inlier scatter, fitted line), but for EVERY RANSAC candidate.
+    Selected candidates: solid line + role in the legend. Unselected: dotted line."""
+    cmap = plt.get_cmap("tab10")
+    fig, ax = plt.subplots(figsize=(7, 8))
+    ax.imshow(img_tresh, cmap="gray", origin="upper", extent=(X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1]), aspect="auto")
+    ax.axvline(0, color="yellow", linestyle="--", linewidth=1, label="Vehicle center")
+
+    guide = out.get("guide")
+    if guide is not None and guide.get("mask") is not None:
+        ax.contour((guide["mask"] > 0).astype(float), levels=[0.5], colors="white", linewidths=1.5, extent=(X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1]), origin="upper")
+        ax.plot([], [], color="white", label=f"guide mask ({guide['source']})")
+
+    pts = out["pts"]
+    role = {v: k for k, v in out["sel"].items() if v is not None}
+    for k, c in enumerate(out["candidates"]):
+        col = cmap(k % 10)
+        inl = pts[c["inliers"]]
+        ax.scatter(inl[:, 0], inl[:, 1], s=5, color=col)
+        z = np.linspace(inl[:, 1].min(), inl[:, 1].max(), 100)
+        tag = f" -> {role[k].upper()}" if k in role else ""
+        ax.plot(c["a"] * z + c["b"], z, color=col, linewidth=2,
+                linestyle="-" if k in role else ":",
+                label=f"#{k} x@mid={x_at(c):+.2f} a={c['a']:+.2f} n={len(inl)}{tag}")
+
+    # estimated side (no inliers): drawn in white because black is invisible on this background
+    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
+    for key in ("ransac_sx", "ransac_dx"):
+        l = out[key]
+        if l is not None and l.get("inliers") is None:
+            ax.plot(l["a"] * z + l["b"], z, "--", color="white", linewidth=2,
+                    label=f"estimated ({l.get('source', 'default')})")
+
+    ax.set(xlabel="x lateral (m)", ylabel="z forward (m)", title="Bird-Eye View: all RANSAC candidates (Canny)", xlim=X_RANGE, ylim=Z_RANGE)
+    ax.grid(alpha=0.2)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
+    fig.tight_layout()
+    if out_path is not None:
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def project_bev_xz(x, z, M_inv):
+    """Road coordinates (x lateral, z forward, metres) -> pixel coordinates in the ORIGINAL image."""
+    col = (np.asarray(x) - X_RANGE[0]) * PX_PER_M
+    row = (Z_RANGE[1] - np.asarray(z)) * PX_PER_M
+    pts = np.column_stack((col, row)).astype(np.float32).reshape(-1, 1, 2)
+    return cv2.perspectiveTransform(pts, M_inv).reshape(-1, 2)
+
+
+def plot_candidates_image(img, out, M_inv, out_path=None):
+    """Original image + every RANSAC candidate (inliers + fitted line), same colours/legend as plot_candidates_thresh.
+    Selected candidates: solid line. Unselected: dotted line."""
+    cmap = plt.get_cmap("tab10")
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.imshow(img)
+    ax.axis("off")
+
+    pts = out["pts"]
+    role = {v: k for k, v in out["sel"].items() if v is not None}
+    for k, c in enumerate(out["candidates"]):
+        col = cmap(k % 10)
+        inl = pts[c["inliers"]]
+        p = project_bev_xz(inl[:, 0], inl[:, 1], M_inv)
+        ax.scatter(p[:, 0], p[:, 1], s=4, color=col)
+        z = np.linspace(inl[:, 1].min(), inl[:, 1].max(), 100)
+        q = project_bev_xz(c["a"] * z + c["b"], z, M_inv)
+        tag = f" -> {role[k].upper()}" if k in role else ""
+        ax.plot(q[:, 0], q[:, 1], color=col, linewidth=2,
+                linestyle="-" if k in role else ":",
+                label=f"#{k} x@mid={x_at(c):+.2f} a={c['a']:+.2f} n={len(inl)}{tag}")
+
+    # estimated side (no inliers): white dashed over a black underlay, to stay visible on bright asphalt
+    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
+    for key in ("ransac_sx", "ransac_dx"):
+        l = out[key]
+        if l is not None and l.get("inliers") is None:
+            q = project_bev_xz(l["a"] * z + l["b"], z, M_inv)
+            ax.plot(q[:, 0], q[:, 1], color="black", linewidth=4)
+            ax.plot(q[:, 0], q[:, 1], "--", color="white", linewidth=2,
+                    label=f"estimated ({l.get('source', 'default')})")
+
+    ax.set_xlim(0, img.shape[1])
+    ax.set_ylim(img.shape[0], 0)            # imshow convention; keeps the image uncropped by the plotted lines
+    ax.set_title("All RANSAC candidates on the original image")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
+    fig.tight_layout()
+    if out_path is not None:
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_candidates_bev(out, guide, out_path=None):                                                             #UNUSED
     """BEV image + guide mask contour + every RANSAC candidate in its own colour (legend: #index)."""
     cmap = plt.get_cmap("tab10")
     ext = (X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1])

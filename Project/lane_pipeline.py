@@ -8,17 +8,8 @@ Z_RANGE = (7.0, 20.0)
 PX_PER_M = 30
 GAUSS_KSIZE = 5
 
-DARK_GRAD_THR = 60     # |Sobel x| threshold for the gray->black / black->gray transitions
-DARK_MAX_W_PX = 9      # max width of a dark line in BEV pixels (9 px = 0.3 m at 30 px/m)
-DARK_V_MAX = 70        # the pixel between the two edges must be darker than this (0-255)
-DARK_DILATE_PX = 3     # grow the dark mask to also cover the Canny edges next to it
-DARK_BH_KSIZE = 15     # horizontal black-hat kernel: must be wider than the widest dark line (DARK_MAX_W_PX)
-DARK_BH_THR = 18       # how much darker than the surroundings (0-255) a pixel must be
-DARK_BH_MIN_LEN_PX = 25  # vertical opening: keeps only structures at least this long
-DARK_EDGE_NEAR_PX = 8   # dark pixels closer than this to the road mask border are NOT removed (they are real edges)
-
-EGO_MIN_AREA_PX = 3000     # smaller ego mask -> considered missing
-EGO_IN_ROAD_MIN = 0.9      # fraction of the ego mask that must lie inside the road mask
+EGO_MIN_AREA_PX = 3000      # smaller ego mask -> considered missing
+EGO_IN_ROAD_MIN = 0.9       # fraction of the ego mask that must lie inside the road mask
 
 def read_calib(path):
     calib = {}
@@ -63,41 +54,20 @@ def brid_eye_view(img, trapezoid, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_
     bew = cv2.warpPerspective(img, M, (width, height)) 
     return bew, M, M_inv
 
-def dark_line_mask(img_bev, grad_thr=DARK_GRAD_THR, max_w=DARK_MAX_W_PX, v_max=DARK_V_MAX, dilate_px=DARK_DILATE_PX):
-    """
-    Thin dark lines (gray -> black -> gray) found with the horizontal gradient: a strong negative
-    Sobel x (entering the dark band) followed, at most max_w px to the right, by a strong positive one
-    (leaving it), with a really dark pixel in between. Returns a uint8 0/255 mask.
-    """
-    gray = cv2.cvtColor(img_bev, cv2.COLOR_RGB2GRAY)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    gx = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3)
-    falling, rising = gx < -grad_thr, gx > grad_thr
-    W = gray.shape[1]
-
-    mask = np.zeros(gray.shape, bool)
-    for k in range(2, max_w + 1):
-        center = blur[:, k // 2: k // 2 + W - k]
-        pair = falling[:, :W - k] & rising[:, k:] & (center < v_max)
-        mask[:, :W - k] |= pair      # left edge of the dark line
-        mask[:, k:] |= pair          # right edge of the dark line
-    out = mask.astype(np.uint8) * 255
-
-    # relative criterion: thin lines darker than their horizontal surroundings (low-contrast lines too)
-    bh_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (DARK_BH_KSIZE, 1))
-    bh = cv2.morphologyEx(blur, cv2.MORPH_BLACKHAT, bh_kernel)
-    rel = (bh > DARK_BH_THR).astype(np.uint8) * 255
-    rel = cv2.morphologyEx(rel, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, DARK_BH_MIN_LEN_PX)))
-    out = cv2.bitwise_or(out, rel)
-
-    if dilate_px > 0:
-        out = cv2.dilate(out, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate_px + 1,) * 2))
-    return out
 
 def valid_bev_mask(img_shape, M, size):
     """BEV pixels that come from inside the original image (True) vs. outside (False)."""
     ones = np.full(img_shape[:2], 255, np.uint8)
     return cv2.warpPerspective(ones, M, size, flags=cv2.INTER_NEAREST) > 0
+
+
+def widen_mask(mask, valid_bev, px=5, margin=6):
+    """Dilate a 0/255 mask by px pixels, without leaking into the black area outside the original image."""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * px + 1, 2 * px + 1))
+    out = cv2.dilate(mask, k)
+    safe = cv2.erode(valid_bev.astype(np.uint8), np.ones((2 * margin + 1, 2 * margin + 1), np.uint8))
+    out[safe == 0] = 0
+    return out
 
 
 def ego_mask_bev(img_bird_eye, valid_bev):
@@ -137,16 +107,16 @@ def pick_guide_mask(ego_mask, road_mask):
 # ---------------- Nuova pipeline ispirata al GitHub ----------------
 def canny_bev_pipeline(img_bev):
     gray = cv2.cvtColor(img_bev, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-    blur = cv2.GaussianBlur(clahe, (GAUSS_KSIZE, GAUSS_KSIZE), 0)
-    canny_out = cv2.Canny(blur, 50, 150)
+    #clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    blur = cv2.GaussianBlur(gray, (GAUSS_KSIZE, GAUSS_KSIZE), 0)
+    canny_out = cv2.Canny(blur, 10, 100)
 
     sobelx = cv2.Sobel(blur, cv2.CV_64F, 1, 0, ksize=3)
     abs_sobelx = np.uint8(np.absolute(sobelx))
     _, vert_mask = cv2.threshold(abs_sobelx, 30, 255, cv2.THRESH_BINARY)
 
     edges = cv2.bitwise_and(canny_out, vert_mask)
-    return dict(gray=gray, clahe=clahe, blur=blur, canny=canny_out, vert_mask=vert_mask, edges=edges)
+    return dict(gray=gray, blur=blur, canny=canny_out, vert_mask=vert_mask, edges=edges)
 
 
 def lane_pipeline(path, img, out_path=None):
@@ -158,12 +128,12 @@ def lane_pipeline(path, img, out_path=None):
     valid_bev = valid_bev_mask(img.shape, M, size)
 
     steps = canny_bev_pipeline(img_bird_eye)
-
-    # 1) road mask from the U-Net: keep only the edges inside the (eroded) road
-        # 1) road mask from the U-Net: keep only the edges inside the road
+        
+    # 1) road mask from the U-Net: keep only the edges inside the (widened) road
     road_mask = nc.road_mask_bev(img_bird_eye, valid_bev)
-    road_keep = road_mask
-    if not road_keep.any():                      # net failed: do not wipe out every edge
+    if road_mask.any():
+        road_keep = widen_mask(road_mask, valid_bev)
+    else:                                        # net failed: do not wipe out every edge
         print("warning: empty road mask, road filter skipped")
         road_keep = np.full_like(road_mask, 255)
 
@@ -171,16 +141,9 @@ def lane_pipeline(path, img, out_path=None):
     guide["bev"] = img_bird_eye
 
     # 2) black-line mask: those pixels cannot become RANSAC points
-    dark = dark_line_mask(img_bird_eye)
-    if road_mask.any():                          # keep dark pixels near the road border: they are the road edge itself
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * DARK_EDGE_NEAR_PX + 1,) * 2)
-        near_edge = cv2.dilate(nc.road_edge(road_mask, valid_bev), k)
-        dark[near_edge > 0] = 0
-
     img_thresh = cv2.bitwise_and(steps["edges"], road_keep)
-    img_thresh = cv2.bitwise_and(img_thresh, cv2.bitwise_not(dark))
 
-    steps.update(road_keep=road_keep, dark=dark, final=img_thresh)
+    steps.update(road_keep=road_keep, final=img_thresh)
     plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path)
     return M_inv, img_thresh, guide
 
@@ -194,20 +157,19 @@ def plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path=None):
     panels = [
         ("1. Original + ROI", vis, None),
         ("2. Bird-eye", img_bird_eye, None),
-        ("3. Gray + CLAHE", steps["clahe"], "gray"),
+        #("3. Gray + CLAHE", steps["clahe"], "gray"),
         ("4. Gaussian blur", steps["blur"], "gray"),
         ("5. Canny", steps["canny"], "gray"),
         ("6. Sobel-x mask", steps["vert_mask"], "gray"),
         ("7. Canny AND Sobel-x", steps["edges"], "gray"),
         ("8. U-Net road mask", road_ov, None),
-        ("9. Dark-line mask", steps["dark"], "gray"),
-        ("10. Final (road AND NOT dark)", steps["final"], "gray"),
+        ("9. Final", steps["final"], "gray"),
     ]
-    fig, axes = plt.subplots(2, 5, figsize=(25, 10))
+    fig, axes = plt.subplots(2, 5, figsize=(25, 10))        
     for a, (title, im, cmap) in zip(axes.ravel(), panels):
+        a.axis("off")
         a.imshow(im, cmap=cmap)
         a.set_title(title)
-        a.axis("off")
     plt.tight_layout()
     if out_path is not None:
         fig.savefig(out_path, dpi=100)
