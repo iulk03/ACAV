@@ -24,11 +24,11 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # number --> one image
 # None   --> all the images of the specificied type
 # 'w'    --> only wrongly detected images
-SINGLE = 0
+SINGLE = 'w'
 TYPE = 0 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 
-wrong = {'um': [],
+wrong = {'um': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
         'umm': [8, 12, 22, 23, 24, 25, 42, 52, 71, 82, 90],
         'uu' : [1, 3, 5, 6, 7, 8, 9, 10, 13, 15, 16, 17, 23, 27, 28, 29, 30, 36, 37, 42, 49, 51, 54, 57, 83, 84, 85, 86, 87, 88, 89, 90, 93, 94, 96]}
 
@@ -40,9 +40,10 @@ def execute(img_idx, img_type):
     calib_path = ROOT / "training" / "calib" / f"{stem}.txt"
 
     lf.reset_tracking()
-    M_inv, thresh = lp.lane_pipeline(calib_path, img, out_path=OUT_DIR / f"{stem}_bev.png")
-    out = lf.lane_fitting(thresh, img, M_inv)
+    M_inv, thresh, guide = lp.lane_pipeline(calib_path, img, out_path=OUT_DIR / f"{stem}_bev.png")
+    out = lf.lane_fitting(thresh, img, M_inv, guide)
     lf.plot_bev_debug(thresh, out, OUT_DIR / f"{stem}_candidates.png")
+    lf.plot_candidates_bev(out, guide, OUT_DIR / f"{stem}_cands_bev.png")
 
     if "overlay" in out:
         cv2.imwrite(str(OUT_DIR / f"{stem}_overlay.png"), cv2.cvtColor(out["overlay"], cv2.COLOR_RGB2BGR))
@@ -67,6 +68,5 @@ else:
         execute(SINGLE, type)
 
 
-# TODO: aggiungere maskera UNet strada per togliere le linee esterne della canny view
-#       usare una black color mask per togliere rumore
-#       avere un'immagini con gli output di ogni step della pipeline
+# TODO: check slope tra due rette 
+#       eliminare linee nel canny se non sono linee rette

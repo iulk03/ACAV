@@ -20,6 +20,13 @@ LANE_W_MAX = 4.5            # larghezza massima plausibile (m)
 SLOPE_DELTA_MAX = 0.1       # differenza massima di pendenza tra le due rette
 W_CENTER = 100.0            # peso della penalità centro auto
 LANE_WIDTH_M = 3.2          # larghezza di default per il ripiego
+MASK_EDGE_MARGIN_PX = 4     # border columns closer than this to the BEV side are fake (clipped by the ROI)
+MASK_MIN_ROWS = 40          # min number of rows with a valid border point
+
+LANE_W_MAX = 5.5            # max plausible lane width (m): wide intersections
+W_CENTER = 20.0             # weak penalty for a lane not centred on the car
+W_OUTSIDE = 100.0           # penalty per metre by which the car (x=0) lies outside the lane
+W_WIDTH = 40.0              # penalty per metre away from LANE_WIDTH_M
 
 # Memoria per lo smoothing temporale
 prev_left_line = None
@@ -132,14 +139,15 @@ def find_candidates(points, n=N_CANDIDATES, threshold=INLINER_TRESHOLD_M):
 
 
 def pair_score(l, r):
-    larg = x_at(r) - x_at(l)
+    xl, xr = x_at(l), x_at(r)
+    larg = xr - xl
     if not (LANE_W_MIN < larg < LANE_W_MAX):
         return -np.inf
     if abs(l["a"] - r["a"]) > SLOPE_DELTA_MAX:
         return -np.inf
-    centro = 0.5 * (x_at(l) + x_at(r))
-    penalita = W_CENTER * abs(centro)
-    return int(l["inliers"].sum()) + int(r["inliers"].sum()) - penalita
+    outside = max(0.0, xl, -xr)            # 0 if the car is between the two lines
+    penalty = W_OUTSIDE * outside + W_CENTER * abs(0.5 * (xl + xr)) + W_WIDTH * abs(larg - LANE_WIDTH_M)
+    return int(l["inliers"].sum()) + int(r["inliers"].sum()) - penalty
 
 
 def best_pair(cands):
@@ -161,6 +169,41 @@ def missing_side(line, width=LANE_WIDTH_M):
         return est, line
     est["b"] = line["b"] + width
     return line, est
+
+def mask_border_line(mask, side, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_RANGE):
+    """Fit x = a*z + b on the left/right border of a binary BEV mask (one point per row)."""
+    h, w = mask.shape
+    pts = []
+    for r in range(MARGIN_PX, h - MARGIN_PX):
+        cols = np.flatnonzero(mask[r])
+        if len(cols) == 0:
+            continue
+        c = cols[0] if side == "left" else cols[-1]
+        if c <= MASK_EDGE_MARGIN_PX or c >= w - 1 - MASK_EDGE_MARGIN_PX:
+            continue
+        pts.append((x_range[0] + c / px_per_m, z_range[1] - r / px_per_m))
+    if len(pts) < MASK_MIN_ROWS:
+        return None
+    return ransac(np.array(pts), min_inliers=MASK_MIN_ROWS)
+
+
+def missing_side_from_guide(line, guide):
+    """Other lane border taken from the mask edge. Returns (left, right) or None."""
+    if guide is None or guide.get("mask") is None:
+        return None
+    known_is_right = x_at(line) > 0
+    edge = mask_border_line(guide["mask"], "left" if known_is_right else "right")
+    if edge is None:
+        return None
+    width = x_at(line) - x_at(edge) if known_is_right else x_at(edge) - x_at(line)
+    if not (LANE_W_MIN < width < LANE_W_MAX) or abs(edge["a"] - line["a"]) > SLOPE_DELTA_MAX:
+        return None
+    est = dict(a=edge["a"], b=edge["b"], inliers=None, n_iter=0, stimata=True, source=guide["source"])
+    return (est, line) if known_is_right else (line, est)
+
+
+def _index(cands, c):
+    return next((i for i, x in enumerate(cands) if x is c), None)   # identity: dicts hold numpy arrays
 
 
 # ---------------- disegno e prospettiva ----------------
@@ -187,7 +230,7 @@ def draw_line(img, M_inv, line_lft, line_rgt, alpha=0.35):
 
 
 # ---------------- funzione principale di fitting ----------------
-def lane_fitting(img_tresh, img, M_inv):
+def lane_fitting(img_tresh, img, M_inv, guide=None):
     global prev_left_line, prev_right_line
 
     pts_dict = points_in_meters(img_tresh)
@@ -198,13 +241,15 @@ def lane_fitting(img_tresh, img, M_inv):
 
     ransac_sx = ransac_dx = None
     stimata = False
+    sel = dict(left=None, right=None)
     if pair is not None:
         ransac_sx, ransac_dx = pair
+        sel = dict(left=_index(cands, pair[0]), right=_index(cands, pair[1]))
     elif cands:
         best = max(cands, key=lambda c: int(c["inliers"].sum()))
-        ransac_sx, ransac_dx = missing_side(best)
+        ransac_sx, ransac_dx = missing_side_from_guide(best, guide) or missing_side(best)
+        sel["right" if x_at(best) > 0 else "left"] = _index(cands, best)
         stimata = True
-
     # Smoothing temporale
     ransac_sx = smooth_line(ransac_sx, prev_left_line)
     ransac_dx = smooth_line(ransac_dx, prev_right_line)
@@ -212,8 +257,7 @@ def lane_fitting(img_tresh, img, M_inv):
     prev_left_line = ransac_sx
     prev_right_line = ransac_dx
 
-    out = dict(points=pts_dict, pts=pts, candidates=cands,
-               ransac_sx=ransac_sx, ransac_dx=ransac_dx, stimata=stimata)
+    out = dict(points=pts_dict, pts=pts, candidates=cands, ransac_sx=ransac_sx, ransac_dx=ransac_dx, stimata=stimata, sel=sel, guide=guide)
     if ransac_sx and ransac_dx:
         out["overlay"] = draw_line(img, M_inv, ransac_sx, ransac_dx)
     return out
@@ -269,6 +313,44 @@ def plot_bev_debug(img_tresh, fitting_out, out_path=None):
     else:
         plt.show()
 
+
+def plot_candidates_bev(out, guide, out_path=None):
+    """BEV image + guide mask contour + every RANSAC candidate in its own colour (legend: #index)."""
+    cmap = plt.get_cmap("tab10")
+    ext = (X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1])
+    fig, ax = plt.subplots(figsize=(8, 8))
+    if guide is not None and guide.get("bev") is not None:
+        ax.imshow(guide["bev"], origin="upper", extent=ext, aspect="auto")
+        if guide.get("mask") is not None:
+            ax.contour((guide["mask"] > 0).astype(float), levels=[0.5], colors="white", linewidths=1.5, extent=ext, origin="upper")
+            ax.plot([], [], color="white", label=f"guide mask ({guide['source']})")
+
+    pts = out["pts"]
+    role = {v: k for k, v in out["sel"].items() if v is not None}
+    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
+    for k, c in enumerate(out["candidates"]):
+        col = cmap(k % 10)
+        inl = pts[c["inliers"]]
+        ax.scatter(inl[:, 0], inl[:, 1], s=6, color=col)
+        ax.plot(c["a"] * z + c["b"], z, color=col, linewidth=1.5)
+        tag = f"  -> {role[k].upper()}" if k in role else ""
+        ax.plot([], [], color=col, marker="o",
+                label=f"#{k} x@mid={x_at(c):+.2f} a={c['a']:+.2f} n={int(c['inliers'].sum())}{tag}")
+
+    for key in ("ransac_sx", "ransac_dx"):
+        l = out[key]
+        if l is not None and l.get("inliers") is None:
+            ax.plot(l["a"] * z + l["b"], z, "--", color="black", linewidth=2,
+                    label=f"estimated ({l.get('source', 'default')})")
+
+    ax.set(xlim=X_RANGE, ylim=Z_RANGE, xlabel="x lateral (m)", ylabel="z forward (m)", title="RANSAC candidates on the BEV")
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8)
+    fig.tight_layout()
+    if out_path is not None:
+        fig.savefig(out_path, dpi=120)
+        plt.close(fig)
+    else:
+        plt.show()
 
 
 def print_candidate_stats(out):
