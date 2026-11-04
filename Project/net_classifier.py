@@ -41,6 +41,7 @@ def pick_device():
         return torch.device("xpu")
     return torch.device("cpu")
 
+INFER_DEVICE = torch.device("cpu") 
 DEVICE = pick_device()
 print("Device:", DEVICE)
 
@@ -174,18 +175,19 @@ def fmt_time(seconds):
 
 
 @torch.no_grad()
-def eval_road_iou(net, val_data):
-    """Mean road IoU on the validation images (original, no shadows): cheap check of the training state."""
+def eval_road_iou(net, val_data, device):
     net.eval()
     ious = []
     for _, (bev, road, valid, _, _) in val_data:
-        p = torch.sigmoid(net(to_tensor(bev).to(DEVICE))[0, 0]).cpu().numpy() > ROAD_THR
+        p = torch.sigmoid(net(to_tensor(bev).to(device))[0, 0]).cpu().numpy() > ROAD_THR
         ious.append((p & road & valid).sum() / max(((p | road) & valid).sum(), 1))
     return float(np.mean(ious))
 
 
 # ---------------- training ----------------
 def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
+    device = pick_device()
+    print("Training device:", device)
     files = list_images()
     rng = np.random.default_rng(SEED)
     rng.shuffle(files)
@@ -200,9 +202,9 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
     print()
     val_data = [(Path(f).stem.split("_")[0], bev_data(f)) for f in val_files]
     n_lane = sum(int(d[4].any()) for d in train_data)
-    print(f"train: {len(train_data)} images ({n_lane} with ego-lane GT), val: {len(val_data)}, device: {DEVICE}")
+    print(f"train: {len(train_data)} images ({n_lane} with ego-lane GT), val: {len(val_data)}, device: {device}")
 
-    net = UNetR18().to(DEVICE)
+    net = UNetR18().to(device)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
@@ -232,7 +234,7 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
                 xs.append(to_tensor(np.ascontiguousarray(bev)))
                 ys.append(torch.cat([tensor(road), tensor(lane)], 1))
                 ms.append(torch.cat([tensor(valid), tensor(lane_valid)], 1))
-            x, y, m = (torch.cat(t).to(DEVICE) for t in (xs, ys, ms))
+            x, y, m = (torch.cat(t).to(device) for t in (xs, ys, ms))
             logits = net(x)
             loss = masked_dice_bce(logits[:, :1], y[:, :1], m[:, :1]) + masked_dice_bce(logits[:, 1:], y[:, 1:], m[:, 1:])
             opt.zero_grad()
@@ -254,7 +256,7 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
         history["loss"].append(total / max(n_batches, 1))
         msg = f"\nepoch {ep + 1}/{epochs} done: loss {history['loss'][-1]:.4f}"
         if (ep + 1) % EVAL_EVERY == 0 or ep == epochs - 1:
-            iou = eval_road_iou(net, val_data)
+            iou = eval_road_iou(net, val_data, device)
             history["val_epochs"].append(ep + 1)
             history["val_iou"].append(iou)
             msg += f" | val road IoU {iou:.3f}"
@@ -282,7 +284,7 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
     with torch.no_grad():
         for key, (bev, road, valid, lane, lane_valid) in val_data:
             for tag, im in (("orig", bev), ("shadow", add_shadows(bev, val_rng))):
-                p = torch.sigmoid(net(to_tensor(im).to(DEVICE))[0]).cpu().numpy() > ROAD_THR
+                p = torch.sigmoid(net(to_tensor(im).to(device))[0]).cpu().numpy() > ROAD_THR
                 inter = (p[0] & road & valid).sum()
                 union = ((p[0] | road) & valid).sum()
                 ious.setdefault((f"road {key}", tag), []).append(inter / max(union, 1))
@@ -292,7 +294,7 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
                     ious.setdefault(("ego-lane", tag), []).append(inter / max(union, 1))
     for (k, tag), v in sorted(ious.items()):
         print(f"val IoU [{k}, {tag}]: {np.mean(v):.3f}  ({len(v)} img)")
-    return net
+    return net.cpu()
 
 
 
@@ -306,23 +308,20 @@ def load_net():
         net = UNetR18(pretrained=False)
         state = torch.load(NET_PATH, map_location="cpu", weights_only=True)
         net.load_state_dict(state)
-        _net = net.to(DEVICE).eval()
+        _net = net.to(INFER_DEVICE).eval()
     return _net
-
 
 @torch.no_grad()
 def road_prob_bev(img_bird_eye, valid_bev, net=None):
-    """Road probability for every BEV pixel (useful for diagnosis)."""
     net = net or load_net()
-    p = torch.sigmoid(net(to_tensor(img_bird_eye).to(DEVICE))[0, 0]).cpu().numpy()
+    p = torch.sigmoid(net(to_tensor(img_bird_eye).to(INFER_DEVICE))[0, 0]).numpy()
     p[~valid_bev] = 0
     return p
 
 @torch.no_grad()
 def ego_prob_bev(img_bird_eye, valid_bev, net=None):
-    """Ego-lane probability for every BEV pixel."""
     net = net or load_net()
-    p = torch.sigmoid(net(to_tensor(img_bird_eye).to(DEVICE))[0, 1]).cpu().numpy()
+    p = torch.sigmoid(net(to_tensor(img_bird_eye).to(INFER_DEVICE))[0, 1]).numpy()
     p[~valid_bev] = 0
     return p
 
