@@ -11,6 +11,12 @@ GAUSS_KSIZE = 5
 EGO_MIN_AREA_PX = 3000      # smaller ego mask -> considered missing
 EGO_IN_ROAD_MIN = 0.9       # fraction of the ego mask that must lie inside the road mask
 
+# ---- bright line detection (signed gradient on log-luminance) ----
+LINE_W_PX = (4, 6, 8)       # allowed line widths (px)  ~0.13-0.27 m at 30 px/m
+LINE_GRAD = 0.05            # threshold on the line response (log-luminance gradient per pixel)
+LINE_MARGIN_PX = 10         # distance from the black area outside the original image
+
+
 def read_calib(path):
     calib = {}
     with open(path) as f:
@@ -104,19 +110,49 @@ def pick_guide_mask(ego_mask, road_mask):
         return dict(mask=road_mask, source="road")
     return dict(mask=None, source=None)
 
-# ---------------- Nuova pipeline ispirata al GitHub ----------------
-def canny_bev_pipeline(img_bev):
+
+# ---------------- bright line detection: signed gradient ----------------
+def _shift_x(a, s):
+    """out[:, x] = a[:, x+s], zero outside the border."""
+    out = np.zeros_like(a)
+    if s > 0:
+        out[:, :-s] = a[:, s:]
+    elif s < 0:
+        out[:, -s:] = a[:, :s]
+    else:
+        out[:] = a
+    return out
+
+
+def bright_line_response(gray, valid_bev):
+    """Response for 'bright line': a rising edge on the left AND a falling edge on the right.
+    Works on the log of the luminance -> relative contrast, independent of shadows.
+      - white line (even in shadow): up then down  -> kept
+      - dark crack / bitumen line:   down then up  -> discarded
+      - shadow border:               single step   -> discarded
+    """
+    blur = cv2.GaussianBlur(gray, (GAUSS_KSIZE, GAUSS_KSIZE), 0).astype(np.float32)
+    gx = cv2.Sobel(np.log(blur + 10.0), cv2.CV_32F, 1, 0, ksize=3) / 8.0   # /8 -> derivative per pixel
+    rise, fall = np.maximum(gx, 0), np.maximum(-gx, 0)
+
+    resp = np.zeros_like(gx)
+    for w in LINE_W_PX:
+        pair = np.minimum(_shift_x(rise, -(w // 2)), _shift_x(fall, w // 2))   # centred on the line centre
+        resp = np.maximum(resp, pair)
+
+    safe = cv2.erode(valid_bev.astype(np.uint8), np.ones((2 * LINE_MARGIN_PX + 1,) * 2, np.uint8)) > 0
+    resp[~safe] = 0
+    return blur, resp
+
+
+def line_bev_pipeline(img_bev, valid_bev):
     gray = cv2.cvtColor(img_bev, cv2.COLOR_RGB2GRAY)
-    #clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-    blur = cv2.GaussianBlur(gray, (GAUSS_KSIZE, GAUSS_KSIZE), 0)
-    canny_out = cv2.Canny(blur, 10, 100)
+    blur, resp = bright_line_response(gray, valid_bev)
 
-    sobelx = cv2.Sobel(blur, cv2.CV_64F, 1, 0, ksize=3)
-    abs_sobelx = np.uint8(np.absolute(sobelx))
-    _, vert_mask = cv2.threshold(abs_sobelx, 30, 255, cv2.THRESH_BINARY)
-
-    edges = cv2.bitwise_and(canny_out, vert_mask)
-    return dict(gray=gray, blur=blur, canny=canny_out, vert_mask=vert_mask, edges=edges)
+    # thinning: keep only the local maximum along x (= line centre), 1 px
+    peak = (resp >= _shift_x(resp, 1)) & (resp >= _shift_x(resp, -1))
+    edges = ((resp > LINE_GRAD) & peak).astype(np.uint8) * 255
+    return dict(gray=gray, blur=blur, resp=resp, edges=edges)
 
 
 def lane_pipeline(path, img, out_path=None):
@@ -127,7 +163,7 @@ def lane_pipeline(path, img, out_path=None):
     size = (img_bird_eye.shape[1], img_bird_eye.shape[0])
     valid_bev = valid_bev_mask(img.shape, M, size)
 
-    steps = canny_bev_pipeline(img_bird_eye)
+    steps = line_bev_pipeline(img_bird_eye, valid_bev)
         
     # 1) road mask from the U-Net: keep only the edges inside the (widened) road
     road_mask = nc.road_mask_bev(img_bird_eye, valid_bev)
@@ -140,7 +176,7 @@ def lane_pipeline(path, img, out_path=None):
     guide = pick_guide_mask(ego_mask_bev(img_bird_eye, valid_bev), road_mask)
     guide["bev"] = img_bird_eye
 
-    # 2) black-line mask: those pixels cannot become RANSAC points
+    # 2) line centres inside the road: these pixels become the RANSAC points
     img_thresh = cv2.bitwise_and(steps["edges"], road_keep)
 
     steps.update(road_keep=road_keep, final=img_thresh)
@@ -157,17 +193,16 @@ def plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path=None):
     panels = [
         ("1. Original + ROI", vis, None),
         ("2. Bird-eye", img_bird_eye, None),
-        #("3. Gray + CLAHE", steps["clahe"], "gray"),
-        ("4. Gaussian blur", steps["blur"], "gray"),
-        ("5. Canny", steps["canny"], "gray"),
-        ("6. Sobel-x mask", steps["vert_mask"], "gray"),
-        ("7. Canny AND Sobel-x", steps["edges"], "gray"),
-        ("8. U-Net road mask", road_ov, None),
-        ("9. Final", steps["final"], "gray"),
+        ("3. Gaussian blur", steps["blur"], "gray"),
+        ("4. Line response", steps["resp"], "gray"),
+        ("5. Line centres", steps["edges"], "gray"),
+        ("6. U-Net road mask", road_ov, None),
+        ("7. Final", steps["final"], "gray"),
     ]
-    fig, axes = plt.subplots(2, 5, figsize=(25, 10))        
-    for a, (title, im, cmap) in zip(axes.ravel(), panels):
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))        
+    for a in axes.ravel():
         a.axis("off")
+    for a, (title, im, cmap) in zip(axes.ravel(), panels):
         a.imshow(im, cmap=cmap)
         a.set_title(title)
     plt.tight_layout()
