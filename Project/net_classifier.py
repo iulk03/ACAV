@@ -547,5 +547,4 @@ def chroma_edges(img_bev, valid_bev, min_grad=CHROMA_MIN, percentile=97, block=6
 if __name__ == "__main__":
     import matplotlib
     matplotlib.use("Agg")   # headless only when run as a script
-    train_ego()
-    
+    train_ego() # training
