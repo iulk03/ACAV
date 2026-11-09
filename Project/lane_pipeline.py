@@ -76,10 +76,10 @@ def widen_mask(mask, valid_bev, px=1, margin=6):
     return out
 
 
-def ego_mask_bev(img_bird_eye, valid_bev):
+def ego_mask_bev(img, M, valid_bev):
     """Ego-lane mask (uint8 0/255) from the 2nd U-Net channel. Empty mask if the net finds nothing."""
     h, w = valid_bev.shape
-    p = nc.ego_prob_bev(img_bird_eye, valid_bev)
+    p = nc.ego_prob_bev(img, M, valid_bev)
     mask = (p > nc.ROAD_THR).astype(np.uint8) * 255
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
@@ -205,6 +205,52 @@ def plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path=None):
     for a, (title, im, cmap) in zip(axes.ravel(), panels):
         a.imshow(im, cmap=cmap)
         a.set_title(title)
+    plt.tight_layout()
+    if out_path is not None:
+        fig.savefig(out_path, dpi=100)
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+
+def plot_ego_debug(calib_path, img, out_path=None):
+    """Ego-lane head inference on one image: raw probability, final mask, guide choice, back-projection on the original image."""
+    calib = read_calib(calib_path)
+    trapezoid = compute_trapezoid(calib)
+    img_bev, M, M_inv = brid_eye_view(apply_roi(img, trapezoid), trapezoid)
+    size = (img_bev.shape[1], img_bev.shape[0])
+    valid_bev = valid_bev_mask(img.shape, M, size)
+
+    p_ego = nc.ego_prob_bev(img_bev, valid_bev)
+    p_road = nc.road_prob_bev(img_bev, valid_bev)
+    ego_mask = ego_mask_bev(img_bev, valid_bev)
+    road_mask = nc.road_mask_bev(img_bev, valid_bev)
+    guide = pick_guide_mask(ego_mask, road_mask)
+
+    def tint(base, mask, color):
+        out = base.copy()
+        sel = mask > 0
+        out[sel] = (0.6 * out[sel] + 0.4 * np.array(color)).astype(np.uint8)
+        return out
+
+    # ego mask projected back on the original image
+    ego_img = cv2.warpPerspective(ego_mask, M_inv, (img.shape[1], img.shape[0]), flags=cv2.INTER_NEAREST)
+
+    n_ego = int((ego_mask > 0).sum())
+    panels = [
+        ("Bird-eye", img_bev, None, None),
+        ("Ego prob (raw)", p_ego, "viridis", (0, 1)),
+        ("Road prob (raw)", p_road, "viridis", (0, 1)),
+        (f"Ego mask on BEV ({n_ego} px)" if n_ego else "Ego mask: EMPTY", tint(img_bev, ego_mask, (0, 255, 0)), None, None),
+        (f"Guide used: {guide['source']}", tint(img_bev, guide["mask"], (255, 0, 0)) if guide["mask"] is not None else img_bev, None, None),
+        ("Ego mask on original", tint(img, ego_img, (0, 255, 0)), None, None),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    for a, (title, im, cmap, lim) in zip(axes.ravel(), panels):
+        a.imshow(im, cmap=cmap, vmin=lim[0] if lim else None, vmax=lim[1] if lim else None)
+        a.set_title(title)
+        a.axis("off")
     plt.tight_layout()
     if out_path is not None:
         fig.savefig(out_path, dpi=100)

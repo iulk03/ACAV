@@ -24,8 +24,8 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # number --> one image
 # None   --> all the images of the specificied type
 # 'w'    --> only wrongly detected images
-SINGLE = 87
-TYPE = 0 # 0 = um, 1 = umm, 2 = uu
+SINGLE = None
+TYPE = 1 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 
 wrong = {'um': [49, 76],
@@ -40,6 +40,7 @@ def execute(img_idx, img_type):
     calib_path = ROOT / "training" / "calib" / f"{stem}.txt"
 
     M_inv, thresh, guide = lp.lane_pipeline(calib_path, img, out_path=OUT_DIR / f"{stem}_bev.png")
+    lp.plot_ego_debug(calib_path, img, OUT_DIR / f"{stem}_ego.png")
     out = lf.lane_fitting(thresh, img, M_inv, guide)
     lf.plot_bev_debug(thresh, out, OUT_DIR / f"{stem}_candidates.png")
     lf.plot_candidates_thresh(thresh, out, OUT_DIR / f"{stem}_cands_thresh.png")

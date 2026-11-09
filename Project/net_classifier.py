@@ -4,6 +4,7 @@ Output saved in road_net.pt file.
 """
 import glob
 from pathlib import Path
+import json
 
 import cv2
 import numpy as np
@@ -12,7 +13,6 @@ import torch.nn as nn
 import torchvision
 import time
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -21,6 +21,10 @@ NET_PATH = BASE_DIR / "road_net.pt"
 
 ROAD_THR = 0.5       # threshold on the road probability
 CHROMA_MIN = 40.0    # colour gradient threshold (OpenCV Lab, Sobel 3x3)
+BDD_DIR = Path("/kaggle/input/datasets/solesensei/solesensei_bdd100k")
+EGO_PATH = Path("ego_net.pt")                    # cwd = /kaggle/working, shows up in the Output tab
+IMG_SIZE = (416, 128)      # (W, H) network input, KITTI-like aspect (3.25)
+CROP = (230, 618)          # BDD rows with a KITTI-like field of view (to be checked visually)
 SEED = 0
 import torch
 
@@ -297,19 +301,179 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
     return net.cpu()
 
 
+def poly_points(poly, n=8):
+    """BDD100K poly2d (vertices + types 'L'/'C') -> (M,2) polyline; cubic Bezier segments sampled with n points."""
+    v, t = np.array(poly["vertices"], np.float32), poly["types"]
+    N = len(v)
+    L = [k for k, c in enumerate(t) if c == "L"]
+    u = np.linspace(0, 1, n, endpoint=False)
+    basis = np.stack([(1 - u) ** 3, 3 * u * (1 - u) ** 2, 3 * u ** 2 * (1 - u), u ** 3], 1)   # (n,4)
+    out = []
+    for a, b in zip(L, L[1:] + [L[0] + N]):                      # last segment wraps around
+        seg = v[[k % N for k in range(a, b + 1)]]
+        out.append(basis @ seg if len(seg) == 4 else seg[:-1])   # 4 points = Bezier, 2 = straight
+    return np.concatenate(out)
+
+
+def drivable_mask(item):
+    """BDD100K labels of one image -> (H,W) uint8 at IMG_SIZE: 0 direct, 1 alternative, 2 background.
+    Crop and resize are applied to the vertices, so the full-res mask is never built."""
+    W, H = IMG_SIZE
+    scale = np.array([W / 1280, H / (CROP[1] - CROP[0])], np.float32)
+    y = np.full((H, W), 2, np.uint8)
+    labels = [l for l in item["labels"] if l["category"] == "drivable area"]
+    for l in sorted(labels, key=lambda l: l["attributes"]["areaType"] == "direct"):   # alternative first, direct on top
+        val = 0 if l["attributes"]["areaType"] == "direct" else 1
+        for p in l["poly2d"]:
+            pts = (poly_points(p) - np.array([0, CROP[0]], np.float32)) * scale
+            cv2.fillPoly(y, [np.round(pts).astype(np.int32)], val)
+    return y
+
+
+def plot_history(history, out_path=None):
+    """Train loss (left axis) and validation IoU for road / ego lane (right axis), one point per epoch."""
+    ep = range(1, len(history["loss"]) + 1)
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(ep, history["loss"], color="tab:blue", label="train loss")
+    ax.set(xlabel="epoch", ylabel="train loss")
+    ax2 = ax.twinx()
+    ax2.plot(ep, history["iou_road"], "o-", color="tab:red", label="val road IoU")
+    ax2.plot(ep, history["iou_ego"], "s-", color="tab:green", label="val ego IoU")
+    ax2.set(ylabel="val IoU", ylim=(0, 1))
+    fig.legend(loc="lower left", bbox_to_anchor=(0.12, 0.12), fontsize=8)
+    fig.tight_layout()
+    if out_path is not None:
+        fig.savefig(out_path, dpi=150)
+    return fig
+
+
+def bdd_data(n=10000):
+    """First n BDD100K val images with drivable labels, cropped + resized to IMG_SIZE -> uint8 x (N,3,H,W), y (N,1,H,W)."""
+    root = BDD_DIR / "bdd100k" / "bdd100k" / "images" / "100k" / "val"
+    with open(BDD_DIR / "bdd100k_labels_release" / "bdd100k" / "labels" / "bdd100k_labels_images_val.json") as f:
+        items = json.load(f)
+    xs, ys = [], []
+    for it in items:
+        y = drivable_mask(it)
+        im = cv2.imread(str(root / it["name"]))
+        if im is None or (y == 2).all():
+            continue
+        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)[CROP[0]:CROP[1]]
+        xs.append(cv2.resize(im, IMG_SIZE, interpolation=cv2.INTER_AREA))
+        ys.append(y)
+        if len(xs) % 200 == 0:
+            print(f"\rloading BDD {len(xs)}/{n}", end="", flush=True)
+        if len(xs) == n:
+            break
+    print()
+    return torch.from_numpy(np.stack(xs)).permute(0, 3, 1, 2).contiguous(), torch.from_numpy(np.stack(ys))[:, None]
+
+
+def augment(x, y):
+    """Batched GPU augmentation. x float (B,3,H,W) in [0,1], y (B,1,H,W). Shadows + flip, no per-image loops."""
+    B, _, H, W = x.shape
+    r = lambda *s: torch.rand(*s, device=x.device)
+    noise = sum(nn.functional.interpolate(r(B, 1, H // c + 2, W // c + 2), size=(H, W), mode="bicubic") for c in (8, 24)) / 2
+    idx = ((0.3 + 0.4 * r(B, 1)) * (H * W - 1)).long()                       # per-sample quantile
+    thr = noise.flatten(1).sort(1).values.gather(1, idx).view(B, 1, 1, 1)
+    shade = ((noise - thr) / (0.03 + 0.05 * r(B, 1, 1, 1)) * 0.5 + 0.5).clamp(0, 1)
+    tint = torch.tensor([0.92, 0.97, 1.05], device=x.device).view(1, 3, 1, 1)
+    dark = 0.35 + 0.35 * r(B, 1, 1, 1)
+    xa = x * (1 - dark * shade) * (1 + (tint - 1) * shade) * (0.85 + 0.3 * r(B, 1, 1, 1))
+    x = torch.where(r(B, 1, 1, 1) < 0.7, xa.clamp(0, 1), x)
+    flip = r(B, 1, 1, 1) < 0.5
+    return torch.where(flip, x.flip(3), x), torch.where(flip, y.flip(3), y)
+
+
+def train_ego(epochs=25, batch=32, lr=3e-4, print_every=10, n_images=10000):
+    """Train the U-Net on BDD100K in perspective: channel 0 = drivable (direct+alt), channel 1 = ego lane (direct)."""
+    x, y = bdd_data(n_images)
+    n_val = len(x) // 10
+    n_train = len(x) - n_val
+    torch.manual_seed(SEED)
+    net = UNetR18().to(DEVICE)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
+    scaler = torch.amp.GradScaler()
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    mean, std = (torch.tensor(a, device=DEVICE).view(1, 3, 1, 1) for a in (MEAN, STD))
+    target = lambda yb: torch.cat([yb < 2, yb == 0], 1).float()
+
+    n_batches = sum(1 for s in range(0, n_train, batch) if min(batch, n_train - s) >= 2)
+    t0 = time.time()
+
+    for ep in range(epochs):
+        net.train()
+        ep_t0 = time.time()
+        total, nb = 0.0, 0
+        for b in torch.randperm(n_train).split(batch):
+            if len(b) < 2:                                   # BatchNorm
+                continue
+            xb, yb = augment(x[n_val + b].to(DEVICE).float() / 255, y[n_val + b].to(DEVICE))
+            t = target(yb)
+            with torch.autocast("cuda", dtype=torch.float16):
+                lg = net((xb - mean) / std).float()
+            ones = torch.ones_like(t[:, :1])
+            loss = masked_dice_bce(lg[:, :1], t[:, :1], ones) + masked_dice_bce(lg[:, 1:], t[:, 1:], ones)
+            opt.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+
+            total += loss.item()
+            nb += 1
+            if nb % print_every == 0 or nb == n_batches:
+                done = ep * n_batches + nb
+                all_batches = epochs * n_batches
+                elapsed = time.time() - t0
+                eta = elapsed / done * (all_batches - done)
+                filled = int(30 * done / all_batches)
+                print(f"\r[{'#' * filled}{'-' * (30 - filled)}] {100 * done / all_batches:5.1f}% | "
+                      f"epoch {ep + 1}/{epochs} | batch {nb}/{n_batches} | loss {total / nb:.4f} | "
+                      f"elapsed {fmt_time(elapsed)} | ETA {fmt_time(eta)}", end="", flush=True)
+        sched.step()
+
+        net.eval()
+        with torch.no_grad():
+            ious = []
+            for xv, yv in zip(x[:n_val].split(64), y[:n_val].split(64)):
+                p = torch.sigmoid(net((xv.to(DEVICE).float() / 255 - mean) / std)) > ROAD_THR
+                t = target(yv.to(DEVICE)) > 0
+                ious.append(((p & t).sum((2, 3)) / (p | t).sum((2, 3)).clamp(min=1)).mean(0))
+            iou = torch.stack(ious).mean(0)
+        print(f"\nepoch {ep + 1}/{epochs} done in {fmt_time(time.time() - ep_t0)}: "
+              f"loss {total / max(nb, 1):.4f} | val IoU road {iou[0]:.3f} ego {iou[1]:.3f}")
+        torch.save({k: v.cpu() for k, v in net.state_dict().items()}, EGO_PATH)   # checkpoint every epoch
+
+
+@torch.no_grad()
+def eval_ego_kitti(net_path=EGO_PATH):
+    """Ego-lane IoU of a BDD-trained net on the KITTI images that have lane GT (um_*), perspective view."""
+    net = load_net(net_path)
+    ious = []
+    for f in list_images():
+        gt = lane_gt(f)
+        if gt is None:
+            continue
+        lane, valid = gt
+        img = cv2.cvtColor(cv2.imread(f), cv2.COLOR_BGR2RGB)
+        small = cv2.resize(img, IMG_SIZE, interpolation=cv2.INTER_AREA)
+        p = torch.sigmoid(net(to_tensor(small).to(INFER_DEVICE))[0, 1]).numpy() > ROAD_THR
+        lane_s = cv2.resize(lane.astype(np.uint8), IMG_SIZE, interpolation=cv2.INTER_NEAREST) > 0
+        valid_s = cv2.resize(valid.astype(np.uint8), IMG_SIZE, interpolation=cv2.INTER_NEAREST) > 0
+        ious.append((p & lane_s & valid_s).sum() / max(((p | lane_s) & valid_s).sum(), 1))
+    print(f"KITTI ego IoU: {np.mean(ious):.3f} on {len(ious)} images")
+    return float(np.mean(ious))
+
 
 # ---------------- inference in the bird-eye view ----------------
-_net = None
+_nets = {}
 
-
-def load_net():
-    global _net
-    if _net is None:
+def load_net(path=NET_PATH):
+    if path not in _nets:
         net = UNetR18(pretrained=False)
-        state = torch.load(NET_PATH, map_location="cpu", weights_only=True)
-        net.load_state_dict(state)
-        _net = net.to(INFER_DEVICE).eval()
-    return _net
+        net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
+        _nets[path] = net.to(INFER_DEVICE).eval()
+    return _nets[path]
 
 @torch.no_grad()
 def road_prob_bev(img_bird_eye, valid_bev, net=None):
@@ -319,12 +483,14 @@ def road_prob_bev(img_bird_eye, valid_bev, net=None):
     return p
 
 @torch.no_grad()
-def ego_prob_bev(img_bird_eye, valid_bev, net=None):
-    net = net or load_net()
-    p = torch.sigmoid(net(to_tensor(img_bird_eye).to(INFER_DEVICE))[0, 1]).numpy()
+def ego_prob_bev(img, M, valid_bev):
+    """Ego-lane probability: net on the ORIGINAL image (perspective, IMG_SIZE), then warped into the BEV."""
+    h, w = img.shape[:2]
+    small = cv2.resize(img, IMG_SIZE, interpolation=cv2.INTER_AREA)
+    p = torch.sigmoid(load_net(EGO_PATH)(to_tensor(small).to(INFER_DEVICE))[0, 1]).numpy()
+    p = cv2.warpPerspective(cv2.resize(p, (w, h)), M, valid_bev.shape[::-1])
     p[~valid_bev] = 0
     return p
-
 
 def road_mask_bev(img_bird_eye, valid_bev, net=None):
     """Road mask (uint8 0/255) in the BEV: threshold, cleaning, ego component, filled holes, smooth border."""
@@ -379,4 +545,6 @@ def chroma_edges(img_bev, valid_bev, min_grad=CHROMA_MIN, percentile=97, block=6
 
 
 if __name__ == "__main__":
-    train()
+    import matplotlib
+    matplotlib.use("Agg")   # headless only when run as a script
+    train_ego()
