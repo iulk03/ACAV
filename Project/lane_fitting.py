@@ -154,15 +154,25 @@ def pair_score(l, r, gl=None, gr=None):
 
 
 def best_pair(cands, gl=None, gr=None):
+    live = [c for c in cands if not dominated(c, cands)]
     best, best_s = None, -np.inf
-    for l in cands:
-        for r in cands:
+    for l in live:
+        for r in live:
             if l is r or x_at(l) >= x_at(r):
                 continue
             s = pair_score(l, r, gl, gr)
             if s > best_s:
                 best, best_s = (l, r), s
     return best
+
+
+def dominated(c, cands):
+    """True if a nearly parallel candidate with more weighted inliers lies within LANE_W_MIN/4: same physical border, keep the stronger."""
+    return any(d is not c
+                and abs(x_at(d) - x_at(c)) < 0.3
+                and abs(d["a"] - c["a"]) < SLOPE_DELTA_MAX
+                and d["w_inl"] > c["w_inl"]
+                for d in cands)
 
 
 def pick_anchor(cands, gl, gr):

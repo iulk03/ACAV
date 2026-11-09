@@ -24,13 +24,13 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # number --> one image
 # None   --> all the images of the specificied type
 # 'w'    --> only wrongly detected images
-SINGLE = None
+SINGLE = 'w'
 TYPE = 0 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 
-wrong = {'um': [49, 76],
-        'umm': [8, 12, 22, 23, 24, 25, 42, 52, 71, 82, 90],
-        'uu' : [1, 3, 5, 6, 7, 8, 9, 10, 13, 15, 16, 17, 23, 27, 28, 29, 30, 36, 37, 42, 49, 51, 54, 57, 83, 84, 85, 86, 87, 88, 89, 90, 93, 94, 96]}
+wrong = {'um': [1, 2, 3, 6, 9, 13, 15, 18, 20, 21, 22, 23, 33, 34, 38, 49, 76],
+        'umm': [],
+        'uu' : []}
 
 def execute(img_idx, img_type):
     files = sorted(glob.glob(f"{ROOT}/training/image_2/{img_type}_*.png"))
@@ -66,7 +66,3 @@ else:
             execute(idx, type)
     else:
         execute(SINGLE, type)
-
-
-# TODO: check slope tra due rette 
-#       eliminare linee nel canny se non sono linee rette
