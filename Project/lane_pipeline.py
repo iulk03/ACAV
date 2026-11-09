@@ -10,6 +10,7 @@ GAUSS_KSIZE = 5
 
 EGO_MIN_AREA_PX = 3000      # smaller ego mask -> considered missing
 EGO_IN_ROAD_MIN = 0.9       # fraction of the ego mask that must lie inside the road mask
+ROAD_KEEP_PX = 6            # the road mask is widened by this many px before filtering the line centres (0.2 m at 30 px/m)
 
 # ---- bright line detection (signed gradient on log-luminance) ----
 LINE_W_PX = (4, 6, 8)       # allowed line widths (px)  ~0.13-0.27 m at 30 px/m
@@ -168,7 +169,7 @@ def lane_pipeline(path, img, out_path=None):
     # 1) road mask from the U-Net: keep only the edges inside the (widened) road
     road_mask = nc.road_mask_bev(img_bird_eye, valid_bev)
     if road_mask.any():
-        road_keep = widen_mask(road_mask, valid_bev)
+        road_keep = widen_mask(road_mask, valid_bev, px=ROAD_KEEP_PX)
     else:                                        # net failed: do not wipe out every edge
         print("warning: empty road mask, road filter skipped")
         road_keep = np.full_like(road_mask, 255)
@@ -211,3 +212,4 @@ def plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path=None):
         plt.close(fig)
     else:
         plt.show()
+        
