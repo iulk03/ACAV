@@ -52,6 +52,29 @@ print("Device:", DEVICE)
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
+class BDDDataset(torch.utils.data.Dataset):
+    """BDD100K split read lazily: JPEG decode + crop + resize + mask rasterisation happen in the DataLoader workers."""
+
+    def __init__(self, split, n=None):
+        cv2.setNumThreads(0)                               # inherited by the forked workers: avoids CPU oversubscription
+        self.root = BDD_DIR / "bdd100k" / "bdd100k" / "images" / "100k" / split
+        t = time.time()
+        with open(BDD_DIR / "bdd100k_labels_release" / "bdd100k" / "labels" / f"bdd100k_labels_images_{split}.json") as f:
+            items = json.load(f)
+        print(f"{split}: labels json loaded in {fmt_time(time.time() - t)} ({len(items)} images)", flush=True)
+        items = [{"name": it["name"], "labels": [l for l in it["labels"] if l["category"] == "drivable area"]} for it in items]
+        self.items = [it for it in items if it["labels"]][:n]
+        print(f"{split}: {len(self.items)} images with drivable polygons", flush=True)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        it = self.items[i]
+        im = cv2.cvtColor(cv2.imread(str(self.root / it["name"])), cv2.COLOR_BGR2RGB)[CROP[0]:CROP[1]]
+        x = cv2.resize(im, IMG_SIZE, interpolation=cv2.INTER_AREA)
+        return torch.from_numpy(x).permute(2, 0, 1), torch.from_numpy(drivable_mask(it))[None]
+
 
 # ---------------- ground truth and data (copied from road_classifier.py) ----------------
 def road_gt(image_path):
@@ -347,28 +370,6 @@ def plot_history(history, out_path=None):
     return fig
 
 
-def bdd_data(n=10000):
-    """First n BDD100K val images with drivable labels, cropped + resized to IMG_SIZE -> uint8 x (N,3,H,W), y (N,1,H,W)."""
-    root = BDD_DIR / "bdd100k" / "bdd100k" / "images" / "100k" / "val"
-    with open(BDD_DIR / "bdd100k_labels_release" / "bdd100k" / "labels" / "bdd100k_labels_images_val.json") as f:
-        items = json.load(f)
-    xs, ys = [], []
-    for it in items:
-        y = drivable_mask(it)
-        im = cv2.imread(str(root / it["name"]))
-        if im is None or (y == 2).all():
-            continue
-        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)[CROP[0]:CROP[1]]
-        xs.append(cv2.resize(im, IMG_SIZE, interpolation=cv2.INTER_AREA))
-        ys.append(y)
-        if len(xs) % 200 == 0:
-            print(f"\rloading BDD {len(xs)}/{n}", end="", flush=True)
-        if len(xs) == n:
-            break
-    print()
-    return torch.from_numpy(np.stack(xs)).permute(0, 3, 1, 2).contiguous(), torch.from_numpy(np.stack(ys))[:, None]
-
-
 def augment(x, y):
     """Batched GPU augmentation. x float (B,3,H,W) in [0,1], y (B,1,H,W). Shadows + flip, no per-image loops."""
     B, _, H, W = x.shape
@@ -385,11 +386,12 @@ def augment(x, y):
     return torch.where(flip, x.flip(3), x), torch.where(flip, y.flip(3), y)
 
 
-def train_ego(epochs=25, batch=32, lr=3e-4, print_every=10, n_images=10000):
+def train_ego(epochs=25, batch=32, lr=3e-4, print_every=10, n_images=None):
     """Train the U-Net on BDD100K in perspective: channel 0 = drivable (direct+alt), channel 1 = ego lane (direct)."""
-    x, y = bdd_data(n_images)
-    n_val = len(x) // 10
-    n_train = len(x) - n_val
+    dl = lambda split, **kw: torch.utils.data.DataLoader(BDDDataset(split, n_images), batch_size=batch, num_workers=4, pin_memory=True, **kw)
+    train_dl = dl("train", shuffle=True, drop_last=True, persistent_workers=True)
+    val_dl = dl("val")
+    n_batches = len(train_dl)
     torch.manual_seed(SEED)
     net = UNetR18().to(DEVICE)
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
@@ -405,10 +407,8 @@ def train_ego(epochs=25, batch=32, lr=3e-4, print_every=10, n_images=10000):
         net.train()
         ep_t0 = time.time()
         total, nb = 0.0, 0
-        for b in torch.randperm(n_train).split(batch):
-            if len(b) < 2:                                   # BatchNorm
-                continue
-            xb, yb = augment(x[n_val + b].to(DEVICE).float() / 255, y[n_val + b].to(DEVICE))
+        for xb, yb in train_dl:
+            xb, yb = augment(xb.to(DEVICE, non_blocking=True).float() / 255, yb.to(DEVICE, non_blocking=True))
             t = target(yb)
             with torch.autocast("cuda", dtype=torch.float16):
                 lg = net((xb - mean) / std).float()
@@ -435,7 +435,7 @@ def train_ego(epochs=25, batch=32, lr=3e-4, print_every=10, n_images=10000):
         net.eval()
         with torch.no_grad():
             ious = []
-            for xv, yv in zip(x[:n_val].split(64), y[:n_val].split(64)):
+            for xv, yv in val_dl:
                 p = torch.sigmoid(net((xv.to(DEVICE).float() / 255 - mean) / std)) > ROAD_THR
                 t = target(yv.to(DEVICE)) > 0
                 ious.append(((p & t).sum((2, 3)) / (p | t).sum((2, 3)).clamp(min=1)).mean(0))
