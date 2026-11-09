@@ -548,3 +548,4 @@ if __name__ == "__main__":
     import matplotlib
     matplotlib.use("Agg")   # headless only when run as a script
     train_ego()
+    
