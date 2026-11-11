@@ -174,13 +174,14 @@ def lane_pipeline(path, img, out_path=None):
         print("warning: empty road mask, road filter skipped")
         road_keep = np.full_like(road_mask, 255)
 
-    guide = pick_guide_mask(ego_mask_bev(img, M, valid_bev), road_mask)
+    ego_mask = ego_mask_bev(img, M, valid_bev)
+    guide = pick_guide_mask(ego_mask, road_mask)
     guide["bev"] = img_bird_eye
 
     # 2) line centres inside the road: these pixels become the RANSAC points
     img_thresh = cv2.bitwise_and(steps["edges"], road_keep)
 
-    steps.update(road_keep=road_keep, final=img_thresh)
+    steps.update(road_keep=road_keep, ego=ego_mask, final=img_thresh)
     plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path)
     return M_inv, img_thresh, guide
 
@@ -189,15 +190,16 @@ def plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path=None):
     cv2.polylines(vis, [trapezoid.astype("int32")], True, (255, 0, 0), 3)
 
     road_ov = img_bird_eye.copy()
-    road_ov[steps["road_keep"] > 0] = (0.6 * road_ov[steps["road_keep"] > 0] + 0.4 * np.array([0, 255, 0])).astype(np.uint8)
-
+    for key, color in (("road_keep", (0, 255, 0)), ("ego", (0, 191, 255))):   # RGB: green road, light blue ego
+        m = steps[key] > 0
+        road_ov[m] = (0.6 * road_ov[m] + 0.4 * np.array(color)).astype(np.uint8)
     panels = [
         ("1. Original + ROI", vis, None),
         ("2. Bird-eye", img_bird_eye, None),
         ("3. Gaussian blur", steps["blur"], "gray"),
         ("4. Line response", steps["resp"], "gray"),
         ("5. Line centres", steps["edges"], "gray"),
-        ("6. U-Net road mask", road_ov, None),
+        ("6. U-Net road (green) + ego (blue)", road_ov, None),
         ("7. Final", steps["final"], "gray"),
     ]
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))        
