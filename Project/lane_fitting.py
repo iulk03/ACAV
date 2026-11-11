@@ -5,7 +5,7 @@ from lane_pipeline import X_RANGE, Z_RANGE, PX_PER_M
 
 # ---------------- parametri RANSAC (Ottimizzati per Canny) ----------------
 MARGIN_PX = 6               # esclude i pixel troppo vicini ai bordi
-INLINER_TRESHOLD_M = 0.12   # soglia in metri per essere inlier
+INLINER_TRESHOLD_M = 0.06    # soglia in metri per essere inlier
 MIN_SEPARATION_M = 4.0      # distanza minima in z tra i due punti
 SUCCESS_PROBABILITY = 0.99  #
 MAX_ITER = 500              #
@@ -31,6 +31,7 @@ VOTE_WIDE_M = 0.35          # banda larga per misurare la rettilineita': una cre
 MIN_POLY_POINTS = 60            # min support points to fit a quadratic on a boundary
 MIN_POLY_SPAN_FRAC = 0.5        # support points must span at least this fraction of the BEV depth
 MAX_CURVATURE = 0.05            # 1/m: |kappa| above this (R < 20 m) is treated as a bad fit -> straight line
+CURV_AGREE = 0.01       # max |c_left - c_right| (x = c*z^2 + ...); otherwise both boundaries stay straight
 
 # ---------------- parametri di scelta della coppia ----------------
 N_CANDIDATES = 5            # quante rette candidate cercare
@@ -225,22 +226,25 @@ def vote_candidates(pts, a_ref, n=N_CANDIDATES):
     return cands
 
 
-def pair_score(l, r, gl=None, gr=None):
+def pair_score(l, r, gl=None, gr=None, reject=GUIDE_REJECT_M):
     xl, xr = x_at(l), x_at(r)
     larg = xr - xl                                     # width: same at any z for ~parallel lines
-    if not (LANE_W_MIN < larg < LANE_W_MAX):
+    guided = gl is not None and gr is not None
+    if larg <= LANE_W_MIN or (larg >= LANE_W_MAX and not guided):
         return -np.inf
     if abs(l["a"] - r["a"]) > SLOPE_DELTA_MAX:
         return -np.inf
     cl, cr = x_car(l), x_car(r)
     if not car_inside(l, r):
         return -np.inf
-    if gl is not None and abs(xl - x_at(gl)) > GUIDE_REJECT_M:      # far from the ego-lane mask: wrong lane / spurious pair
+    if gl is not None and abs(xl - x_at(gl)) > reject:
         return -np.inf
-    if gr is not None and abs(xr - x_at(gr)) > GUIDE_REJECT_M:
+    if gr is not None and abs(xr - x_at(gr)) > reject:
         return -np.inf
     support = min(l["w_inl"], W_SUPPORT_CAP) + min(r["w_inl"], W_SUPPORT_CAP)
-    penalty = W_CENTER * abs(0.5 * (cl + cr)) + W_WIDTH * abs(larg - LANE_WIDTH_M)
+    penalty = W_CENTER * abs(0.5 * (cl + cr))
+    if not guided:
+        penalty += W_WIDTH * abs(larg - LANE_WIDTH_M)
     if gl is not None:
         penalty += W_GUIDE * abs(xl - x_at(gl))
     if gr is not None:
@@ -248,13 +252,13 @@ def pair_score(l, r, gl=None, gr=None):
     return support - penalty
 
 
-def best_pair(cands, gl=None, gr=None):
+def best_pair(cands, gl=None, gr=None, reject=GUIDE_REJECT_M):
     best, best_s = None, -np.inf
     for l in cands:
         for r in cands:
             if l is r or x_at(l) >= x_at(r):
                 continue
-            s = pair_score(l, r, gl, gr)
+            s = pair_score(l, r, gl, gr, reject)
             if s > best_s:
                 best, best_s = (l, r), s
     return best
@@ -268,7 +272,8 @@ def pick_anchor(cands, gl, gr):
         scored = [t for t in scored if t[0] < GUIDE_TOL_M]
         if scored:
             return min(scored, key=lambda t: t[0])[1]
-    return max(cands, key=lambda c: c["w_inl"])
+    strong = [c for c in cands if c["w_inl"] >= 0.25 * max(d["w_inl"] for d in cands)]   # ignore weak cracks
+    return min(strong, key=lambda c: abs(x_at(c)))                                       # nearest to the car
 
 
 def missing_side(line, width=LANE_WIDTH_M):
@@ -302,7 +307,10 @@ def guide_borders(guide):
     """(left, right) border lines of the guide mask. Only if the guide is the ego-lane mask, else (None, None)."""
     if guide is None or guide.get("mask") is None or guide.get("source") != "lane":
         return None, None
-    return mask_border_line(guide["mask"], "left"), mask_border_line(guide["mask"], "right")
+    gl, gr = mask_border_line(guide["mask"], "left"), mask_border_line(guide["mask"], "right")
+    if gl is not None and gr is not None and x_at(gr) - x_at(gl) <= LANE_W_MIN:
+        return None, None
+    return gl, gr
 
 
 def road_direction(guide):
@@ -350,26 +358,33 @@ def support_points(line, pts):
 
 
 def fit_boundary_poly(line, pts):
-    straight = np.array([0.0, line["a"], line["b"]])
+    straight = dict(c=0.0, a=line["a"], b=line["b"], zr=Z_RANGE)
     p = support_points(line, pts)
     if p is None or len(p) < MIN_POLY_POINTS or np.ptp(p[:, 1]) < MIN_POLY_SPAN_FRAC * (Z_RANGE[1] - Z_RANGE[0]):
         return straight
-    z, x = p[:, 1], p[:, 0]
-    c, a, b = np.polyfit(z, x, 2)
+    coef = np.array([0.0, line["a"], line["b"]])
+    for _ in range(2):                                 # refit around the parabola itself, always with the tight band
+        near = np.abs(pts[:, 0] - np.polyval(coef, pts[:, 1])) <= INLINER_TRESHOLD_M
+        if near.sum() < MIN_POLY_POINTS:
+            return straight
+        coef = np.polyfit(pts[near, 1], pts[near, 0], 2)
+    c, a, b = coef
     if abs(2 * c) > MAX_CURVATURE:
         return straight
-    # the parabola must explain the points much better than the line, otherwise it is noise
+    z, x = pts[near, 1], pts[near, 0]
     rss_lin = np.sum((x - np.polyval(np.polyfit(z, x, 1), z)) ** 2)
-    rss_quad = np.sum((x - np.polyval([c, a, b], z)) ** 2)
-    if rss_quad > 0.7 * rss_lin:
+    rss_quad = np.sum((x - np.polyval(coef, z)) ** 2)
+    if rss_quad > 0.7 * rss_lin:                       # the parabola must beat the line on the same points
         return straight
-    return np.array([c, a, b])
+    return dict(c=c, a=a, b=b, zr=(p[:, 1].min(), p[:, 1].max()))
 
 
 # ---------------- disegno e prospettiva ----------------
 def line_on_image(line, M_inv, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
     z = np.linspace(z_range[0], z_range[1], 100)
-    x = line.get("c", 0.0) * z ** 2 + line["a"] * z + line["b"]
+    zc = np.clip(z, *line.get("zr", z_range))          # parabola only inside the support
+    c = line.get("c", 0.0)
+    x = c * zc ** 2 + line["a"] * zc + line["b"] + (2 * c * zc + line["a"]) * (z - zc)   # tangent outside
     col = (x - x_range[0]) * px_per_m
     row = (z_range[1] - z) * px_per_m
     points_px = np.column_stack((col, row)).astype(np.float32).reshape(-1, 1, 2)
@@ -409,6 +424,11 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
     if not cands and a_ref is not None:                 # rete di sicurezza: direzione sbagliata -> senza vincolo
         cands = find_candidates(pts)
     pair = best_pair(cands, gl, gr)
+    hits = [any(abs(x_at(c) - x_at(g)) < GUIDE_TOL_M for c in cands) for g in (gl, gr) if g is not None]
+    odd_width = gl is not None and gr is not None and abs(x_at(gr) - x_at(gl) - LANE_WIDTH_M) > GUIDE_REJECT_M
+    trusted = all(hits) if odd_width else any(hits)
+    if pair is None and not trusted:    # guide unreliable: drop it (an odd-width mask needs both borders confirmed)
+        pair = best_pair(cands)
 
     ransac_sx = ransac_dx = None
     stimata = False
@@ -425,11 +445,14 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
     out = dict(points=pts_dict, pts=pts, candidates=cands, ransac_sx=ransac_sx, ransac_dx=ransac_dx,
                stimata=stimata, sel=sel, guide=guide, slope_ref=a_ref)
     if ransac_sx and ransac_dx:
-        curved = [dict(zip("cab", fit_boundary_poly(l, pts))) for l in (ransac_sx, ransac_dx)]
+        curved = [fit_boundary_poly(l, pts) for l in (ransac_sx, ransac_dx)]
+        if abs(curved[0]["c"] - curved[1]["c"]) > CURV_AGREE:     # curvature must be shared by both borders
+            curved = [dict(c=0.0, a=l["a"], b=l["b"], zr=Z_RANGE) for l in (ransac_sx, ransac_dx)]
         out["overlay"] = draw_line(img, M_inv, *curved)
         pred = np.zeros(img.shape[:2], np.uint8)
         cv2.fillPoly(pred, [lane_polygon(*curved, M_inv)], 1)
         out["pred_mask"] = pred > 0                     # usata da main.py per l'IoU con la GT ego-lane
+        out["curved"] = curved
     return out
 
 
@@ -464,6 +487,9 @@ def plot_bev_debug(img_tresh, fitting_out, out_path=None):
             name = f"Retta {label.lower()} (STIMATA)"
         ax.plot(line["a"] * z_values + line["b"], z_values,
                 color=color, linewidth=2, linestyle=style, label=name)
+    for l in fitting_out.get("curved", []):
+        z = np.linspace(*l["zr"], 100)
+        ax.plot(l["c"] * z ** 2 + l["a"] * z + l["b"], z, "w--", linewidth=1)
 
     ax.set(
         xlabel="x laterale (m)",

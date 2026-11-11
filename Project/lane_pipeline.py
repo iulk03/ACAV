@@ -175,6 +175,7 @@ def lane_pipeline(path, img, out_path=None):
         road_keep = np.full_like(road_mask, 255)
 
     ego_mask = ego_mask_bev(img, M, valid_bev)
+    w = (ego_mask > 0).sum(1) / PX_PER_M
     guide = pick_guide_mask(ego_mask, road_mask)
     guide["bev"] = img_bird_eye
 
@@ -182,7 +183,8 @@ def lane_pipeline(path, img, out_path=None):
     img_thresh = cv2.bitwise_and(steps["edges"], road_keep)
 
     steps.update(road_keep=road_keep, ego=ego_mask, final=img_thresh)
-    plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path)
+    if out_path is not None:
+        plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path)
     return M_inv, img_thresh, guide
 
 def plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path=None):

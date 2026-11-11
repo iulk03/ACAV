@@ -26,17 +26,41 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # number --> one image
 # None   --> all the images of the specificied type
 # 'w'    --> only wrongly detected images
-SINGLE = 'w'
-TYPE = 1 # 0 = um, 1 = umm, 2 = uu
+SINGLE = None
+TYPE = 0 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
+DEBUG = not ALL and SINGLE is not None   # full debug images only when few images are processed
 
 wrong = {'um': [49, 76],
-        'umm': [8, 13, 20, 23, 57, 58],
+        'umm': [16, 15],
         'uu' : [1, 3, 5, 6, 7, 8, 9, 10, 13, 15, 16, 17, 23, 27, 28, 29, 30, 36, 37, 42, 49, 51, 54, 57, 83, 84, 85, 86, 87, 88, 89, 90, 93, 94, 96]}
 
 IOU_FAIL = 0.5      # um: below this ego-lane IoU an image is considered wrong
 ROAD_FAIL = 0.8     # umm / uu: below this on-road fraction an image is considered wrong
 scores = {}         # type -> [(img_idx, score)]
+
+
+def ego_width_stats():
+    """Ego-mask width (m) near the car (z=7) vs far (z=20) on every image. No plots, no road mask, no fitting."""
+    for img_type, n in OPTIONS.items():
+        files = sorted(glob.glob(f"{ROOT}/training/image_2/{img_type}_*.png"))
+        res = []
+        for idx in range(n):
+            f = Path(files[idx])
+            img = cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB)
+            trapezoid = lp.compute_trapezoid(lp.read_calib(ROOT / "training" / "calib" / f"{f.stem}.txt"))
+            bev, M, _ = lp.brid_eye_view(lp.apply_roi(img, trapezoid), trapezoid)
+            valid = lp.valid_bev_mask(img.shape, M, (bev.shape[1], bev.shape[0]))
+            ego = lp.ego_mask_bev(img, M, valid) > 0
+            if not ego.any():
+                print(f"{img_type} {idx}: ego mask empty")
+                continue
+            w = ego.sum(1) / lp.PX_PER_M                       # row 0 = z 20 m, last row = z 7 m
+            res.append((idx, w[-10:].mean(), w[:10].mean()))
+            print(f"{img_type} {idx}: near {res[-1][1]:.1f} m, far {res[-1][2]:.1f} m")
+        d = np.array([r[1] - r[2] for r in res])
+        print(f"[{img_type}] near-far: mean {d.mean():+.2f} m, median {np.median(d):+.2f} m, {(d > 1.0).sum()}/{len(d)} with near wider than far by >1 m")
+        print(f"[{img_type}] narrowing = {[r[0] for r in res if r[1] - r[2] > 1.0]}")
 
 
 def roi_mask(img, calib_path, valid):
@@ -85,11 +109,12 @@ def execute(img_idx, img_type):
     img = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
     calib_path = ROOT / "training" / "calib" / f"{stem}.txt"
 
-    M_inv, thresh, guide = lp.lane_pipeline(calib_path, img, out_path=OUT_DIR / f"{stem}_bev.png")
+    M_inv, thresh, guide = lp.lane_pipeline(calib_path, img, out_path=OUT_DIR / f"{stem}_bev.png" if DEBUG else None)
     out = lf.lane_fitting(thresh, img, M_inv, guide)
-    lf.plot_bev_debug(thresh, out, OUT_DIR / f"{stem}_candidates.png")
-    lf.plot_candidates_thresh(thresh, out, OUT_DIR / f"{stem}_cands_thresh.png")
-    lf.plot_candidates_image(img, out, M_inv, OUT_DIR / f"{stem}_cands_img.png")
+    if DEBUG:
+        lf.plot_bev_debug(thresh, out, OUT_DIR / f"{stem}_candidates.png")
+        lf.plot_candidates_thresh(thresh, out, OUT_DIR / f"{stem}_cands_thresh.png")
+        lf.plot_candidates_image(img, out, M_inv, OUT_DIR / f"{stem}_cands_img.png")
 
     sc = image_score(image_path, img, out, calib_path, img_type)
     iou_txt = f", {'IoU' if img_type == 'um' else 'on-road'}: {sc:.2f}"
@@ -116,6 +141,7 @@ else:
             execute(idx, type)
     else:
         execute(SINGLE, type)
+
 
 report()
 
