@@ -27,7 +27,7 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # None   --> all the images of the specificied type
 # 'w'    --> only wrongly detected images
 SINGLE = None
-TYPE = 0 # 0 = um, 1 = umm, 2 = uu
+TYPE = 1 # 0 = um, 1 = umm, 2 = uu
 ALL = False # True to process all the images (um, umm, uu)
 
 wrong = {'um': [49, 76],

@@ -77,10 +77,10 @@ def widen_mask(mask, valid_bev, px=1, margin=6):
     return out
 
 
-def ego_mask_bev(img_bird_eye, valid_bev):
+def ego_mask_bev(img, M, valid_bev):
     """Ego-lane mask (uint8 0/255) from the 2nd U-Net channel. Empty mask if the net finds nothing."""
     h, w = valid_bev.shape
-    p = nc.ego_prob_bev(img_bird_eye, valid_bev)
+    p = nc.ego_prob_bev(img, M, valid_bev)
     mask = (p > nc.ROAD_THR).astype(np.uint8) * 255
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
@@ -174,7 +174,7 @@ def lane_pipeline(path, img, out_path=None):
         print("warning: empty road mask, road filter skipped")
         road_keep = np.full_like(road_mask, 255)
 
-    guide = pick_guide_mask(ego_mask_bev(img_bird_eye, valid_bev), road_mask)
+    guide = pick_guide_mask(ego_mask_bev(img, M, valid_bev), road_mask)
     guide["bev"] = img_bird_eye
 
     # 2) line centres inside the road: these pixels become the RANSAC points
@@ -212,4 +212,3 @@ def plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path=None):
         plt.close(fig)
     else:
         plt.show()
-        
