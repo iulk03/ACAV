@@ -27,8 +27,8 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # None   --> all the images of the specificied type
 # 'w'    --> only wrongly detected images
 SINGLE = None
-TYPE = 0 # 0 = um, 1 = umm, 2 = uu
-ALL = False # True to process all the images (um, umm, uu)
+TYPE = 2 # 0 = um, 1 = umm, 2 = uu
+ALL = True # True to process all the images (um, umm, uu)
 DEBUG = not ALL and SINGLE is not None   # full debug images only when few images are processed
 
 wrong = {'um': [49, 76],
@@ -38,6 +38,8 @@ wrong = {'um': [49, 76],
 IOU_FAIL = 0.5      # um: below this ego-lane IoU an image is considered wrong
 ROAD_FAIL = 0.8     # umm / uu: below this on-road fraction an image is considered wrong
 scores = {}         # type -> [(img_idx, score)]
+marks = {}          # type -> [(img_idx, interior marking support)]
+supports = {}       # type -> [(img_idx, max candidate support)]  (diagnostic for the 'has markings' idea)
 
 
 def ego_width_stats():
@@ -100,6 +102,17 @@ def report():
         print(f"[{t}] {label}: mean {v.mean():.3f}, median {np.median(v):.3f}, {len(bad)}/{len(v)} under {fail}")
         print(f"[{t}] wrong = {bad}")
         print(f"[{t}] lowest 8: " + ", ".join(f"{i} ({s:.2f})" for i, s in worst))
+    print()
+    for t, res in marks.items():
+        m = np.array([r[1] for r in res if r[1] >= 0])
+        if len(m):
+            print(f"[{t}] interior marking support: min {m.min():.0f}, p25 {np.percentile(m, 25):.0f}, median {np.median(m):.0f}, p75 {np.percentile(m, 75):.0f}, max {m.max():.0f}; "
+                  f"{(m < lf.MARKING_MIN_SUPPORT).sum()}/{len(m)} under the gate ({lf.MARKING_MIN_SUPPORT:.0f})")
+    print()
+    for t, res in supports.items():
+        m = np.array([r[1] for r in res])
+        print(f"[{t}] max candidate support: min {m.min():.0f}, p25 {np.percentile(m, 25):.0f}, median {np.median(m):.0f}, p75 {np.percentile(m, 75):.0f}, max {m.max():.0f}")
+        print(f"[{t}] lowest 10: " + ", ".join(f"{i} ({s:.0f})" for i, s in sorted(res, key=lambda r: r[1])[:10]))
 
 
 def execute(img_idx, img_type):
@@ -118,7 +131,16 @@ def execute(img_idx, img_type):
 
     sc = image_score(image_path, img, out, calib_path, img_type)
     iou_txt = f", {'IoU' if img_type == 'um' else 'on-road'}: {sc:.2f}"
+    if out.get("road_frac") is not None:
+        iou_txt += f", road_frac: {out['road_frac']:.2f}" + (f" [ALT: {out['alt']}]" if out.get("alt") else "")
     scores.setdefault(img_type, []).append((img_idx, sc))
+    sup = out.get("supports", [])
+    supports.setdefault(img_type, []).append((img_idx, sup[0] if sup else 0.0))
+    ms = out.get("marking_support")
+    marks.setdefault(img_type, []).append((img_idx, -1.0 if ms is None else ms))
+    iou_txt += f", marks: {'n/a' if ms is None else f'{ms:.0f}'}" + (" [NO MARKS]" if out.get("no_marks") else "")
+    src = (out.get("guide") or {}).get("source")
+    iou_txt += f", guide: {src}, supp: [{', '.join(f'{s:.0f}' for s in sup[:3])}]"
 
     if "overlay" in out:
         cv2.imwrite(str(OUT_DIR / f"{stem}_overlay.png"), cv2.cvtColor(out["overlay"], cv2.COLOR_RGB2BGR))
@@ -144,7 +166,3 @@ else:
 
 
 report()
-
-
-# TODO: check slope tra due rette 
-#       eliminare linee nel canny se non sono linee rette

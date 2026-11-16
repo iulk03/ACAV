@@ -178,6 +178,8 @@ def lane_pipeline(path, img, out_path=None):
     w = (ego_mask > 0).sum(1) / PX_PER_M
     guide = pick_guide_mask(ego_mask, road_mask)
     guide["bev"] = img_bird_eye
+    guide["road"] = road_mask          # used by lane_fitting to check the chosen lane against the road
+    guide["valid"] = valid_bev
 
     # 2) line centres inside the road: these pixels become the RANSAC points
     img_thresh = cv2.bitwise_and(steps["edges"], road_keep)

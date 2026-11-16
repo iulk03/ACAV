@@ -27,11 +27,11 @@ VOTE_REFINE_SPAN_M = 4.0    # estensione minima in z dei punti per rifinire anch
 VOTE_REFINE_BAND_M = 0.08   # per rifinire la pendenza si usano solo i punti entro questa distanza dalla retta preliminare
 VOTE_WIDE_M = 0.35          # banda larga per misurare la rettilineita': una crepa sinuosa esce dalla banda stretta, una linea no
 
-# ---------------- parabola (curve) ----------------
-MIN_POLY_POINTS = 60            # min support points to fit a quadratic on a boundary
-MIN_POLY_SPAN_FRAC = 0.5        # support points must span at least this fraction of the BEV depth
+# ---------------- parabola (curve) - dal secondo file ----------------
+MIN_POLY_POINTS = 25         # min support points to fit a quadratic on a boundary
+MIN_POLY_SPAN_FRAC = 0.35        # support points must span at least this fraction of the BEV depth
 MAX_CURVATURE = 0.05            # 1/m: |kappa| above this (R < 20 m) is treated as a bad fit -> straight line
-CURV_AGREE = 0.01       # max |c_left - c_right| (x = c*z^2 + ...); otherwise both boundaries stay straight
+CURV_AGREE = 0.01               # max |c_left - c_right| (x = c*z^2 + ...); otherwise both boundaries stay straight
 
 # ---------------- parametri di scelta della coppia ----------------
 N_CANDIDATES = 5            # quante rette candidate cercare
@@ -51,6 +51,18 @@ W_SUPPORT_CAP = 400.0       # cap on the weighted inlier support of a single lin
 W_GUIDE = 80.0              # penalty per metre of disagreement with the guide border (lane guide only)
 GUIDE_TOL_M = 0.6           # max distance for a candidate to be considered "matching" a guide border
 GUIDE_REJECT_M = 1.0         # a pair whose border is further than this from the (lane) guide border is rejected outright
+
+
+# ---------------- verifica corsia vs maschera strada (post-hoc) ----------------
+ROAD_OK_FRAC = 0.75         # sopra questa frazione di poligono sulla strada: la scelta resta com'e'
+ROAD_GOOD_FRAC = 0.85       # un'alternativa "buona" deve avere almeno questa frazione sulla strada...
+ROAD_GAIN_GOOD = 0.10       # ...e migliorare di almeno questo rispetto alla scelta originale
+ROAD_GAIN_ANY = 0.20        # se nessuna arriva a ROAD_GOOD_FRAC: la migliore passa solo con questo guadagno
+
+
+# ---------------- gate "ci sono marcature?" (solo vernice, lontano dai bordi strada) ----------------
+INTERIOR_ERODE_M = 0.8      # la road_mask viene erosa di questo: bordo asfalto/erba, cordoli e ombre di bordo escono
+MARKING_MIN_SUPPORT = 100.0 # supporto pesato minimo di una linea INTERNA alla strada; sotto -> niente marcature (NON calibrato!)
 
 
 # ---------------- da immagine binaria a coordinate strada ----------------
@@ -276,9 +288,10 @@ def pick_anchor(cands, gl, gr):
     return min(strong, key=lambda c: abs(x_at(c)))                                       # nearest to the car
 
 
-def missing_side(line, width=LANE_WIDTH_M):
+def missing_side(line, width=LANE_WIDTH_M, flip=False):
+    """Lato mancante a distanza `width`. Di default sul lato verso l'auto; flip=True -> sul lato opposto."""
     est = dict(a=line["a"], b=None, inliers=None, n_iter=0, stimata=True)
-    if x_at(line) > 0:
+    if (x_at(line) > 0) != flip:
         est["b"] = line["b"] - width
         return est, line
     est["b"] = line["b"] + width
@@ -343,11 +356,114 @@ def missing_side_from_guide(line, guide):
     return (est, line) if known_is_right else (line, est)
 
 
+# ---------------- frazione di corsia sulla strada + alternative ----------------
+def curved_pair(l, r, pts):
+    """Fit parabolico dei due bordi (logica diretta presa dal secondo file, con regola di curvatura condivisa)."""
+    curved = [fit_boundary_poly(x, pts) for x in (l, r)]
+    if abs(curved[0]["c"] - curved[1]["c"]) > CURV_AGREE:     # curvature must be shared by both borders
+        curved = [dict(c=0.0, a=x["a"], b=x["b"], zr=Z_RANGE) for x in (l, r)]
+    return curved
+
+
+def boundary_x(line, z=_Z_ROW):
+    """x del bordo per ogni riga BEV (stessa formula di line_on_image: parabola nel supporto, tangente fuori)."""
+    zc = np.clip(z, *line["zr"])
+    c = line["c"]
+    return c * zc ** 2 + line["a"] * zc + line["b"] + (2 * c * zc + line["a"]) * (z - zc)
+
+
+def lane_bev_mask(curved, shape):
+    """Poligono corsia nel BEV (bool), una riga alla volta tra bordo sinistro e destro."""
+    w = shape[1]
+    xl, xr = (boundary_x(l) for l in curved)
+    cl, cr = (xl - X_RANGE[0]) * PX_PER_M, (xr - X_RANGE[0]) * PX_PER_M
+    cols = np.arange(w)[None, :] + 0.5
+    return (cols >= cl[:, None]) & (cols <= cr[:, None])
+
+
+def lane_road_frac(l, r, pts, road, valid):
+    """Frazione del poligono corsia (nella parte visibile del BEV) che sta sulla road_mask."""
+    lane = lane_bev_mask(curved_pair(l, r, pts), road.shape) & valid
+    area = int(lane.sum())
+    if area == 0:
+        return 0.0
+    return float((lane & (road > 0)).sum() / area)
+
+
+def lane_from_road(road, width=LANE_WIDTH_M):
+    """Corsia dalla sola road_mask. Strada stretta (<= LANE_W_MAX): carreggiata intera.
+    Strada larga: la parte destra, larga `width`. None se i bordi della maschera non si trovano."""
+    gl, gr = mask_border_line(road, "left"), mask_border_line(road, "right")
+    if gl is None or gr is None:
+        return None
+    mk = lambda l: dict(a=l["a"], b=l["b"], inliers=None, n_iter=0, stimata=True, source="road")
+    if x_at(gr) - x_at(gl) <= LANE_W_MAX:
+        return mk(gl), mk(gr)
+    right = mk(gr)
+    left = mk(gr)
+    left["b"] = gr["b"] - width
+    return left, right
+
+
+def road_alternatives(cands, pair, gl, gr, road):
+    """Alternative alla scelta originale, nell'ordine: (1) altre coppie valide, (2) una candidata con il lato
+    mancante da bordo maschera / default / lato opposto, (3) corsia dalla sola road_mask.
+    Ogni elemento: (nome, sinistra, destra, stimata, sel)."""
+    alts = []
+
+    # 1) altre coppie valide (con o senza la guida), dalla migliore
+    pairs = []
+    for i, l in enumerate(cands):
+        for j, r in enumerate(cands):
+            if i == j or x_at(l) >= x_at(r):
+                continue
+            if pair is not None and l is pair[0] and r is pair[1]:
+                continue
+            s = max(pair_score(l, r, gl, gr), pair_score(l, r))
+            if np.isfinite(s):
+                pairs.append((s, i, j))
+    for s, i, j in sorted(pairs, reverse=True):
+        alts.append(("pair", cands[i], cands[j], False, dict(left=i, right=j)))
+
+    # 2) candidata singola, lato mancante in tre modi
+    road_guide = dict(mask=road, source="road")
+    for i in sorted(range(len(cands)), key=lambda k: -cands[k]["w_inl"]):
+        c = cands[i]
+        side = "right" if x_at(c) > 0 else "left"
+        sel = dict(left=None, right=None)
+        sel[side] = i
+        for name, res in (("single+mask", missing_side_from_guide(c, road_guide)),
+                          ("single+default", missing_side(c)),
+                          ("single+flip", missing_side(c, flip=True))):
+            if res is not None:
+                alts.append((name, res[0], res[1], True, dict(sel)))
+
+    # 3) solo road_mask
+    res = lane_from_road(road)
+    if res is not None:
+        alts.append(("road-only", res[0], res[1], True, dict(left=None, right=None)))
+    return alts
+
+
+def pick_alternative(alts, f0, pts, road, valid):
+    """Prima alternativa (in ordine) con frac >= ROAD_GOOD_FRAC e guadagno >= ROAD_GAIN_GOOD.
+    Se non c'e': la migliore in assoluto, solo se il guadagno e' >= ROAD_GAIN_ANY. Altrimenti None."""
+    scored = [(lane_road_frac(a[1], a[2], pts, road, valid), a) for a in alts]
+    for f, a in scored:
+        if f >= ROAD_GOOD_FRAC and f - f0 >= ROAD_GAIN_GOOD:
+            return a, f
+    if scored:
+        f, a = max(scored, key=lambda t: t[0])           # a parita' vince la prima in ordine
+        if f - f0 >= ROAD_GAIN_ANY:
+            return a, f
+    return None
+
+
 def _index(cands, c):
     return next((i for i, x in enumerate(cands) if x is c), None)   # identity: dicts hold numpy arrays
 
 
-# ---------------- fit parabolico dopo il RANSAC ----------------
+# ---------------- fit parabolico (preso dal secondo file) ----------------
 def support_points(line, pts):
     """Return the (x, z) points supporting a boundary, or None if they are not reliable (estimated line)."""
     if line.get("stimata"):
@@ -362,21 +478,16 @@ def fit_boundary_poly(line, pts):
     p = support_points(line, pts)
     if p is None or len(p) < MIN_POLY_POINTS or np.ptp(p[:, 1]) < MIN_POLY_SPAN_FRAC * (Z_RANGE[1] - Z_RANGE[0]):
         return straight
-    coef = np.array([0.0, line["a"], line["b"]])
-    for _ in range(2):                                 # refit around the parabola itself, always with the tight band
-        near = np.abs(pts[:, 0] - np.polyval(coef, pts[:, 1])) <= INLINER_TRESHOLD_M
-        if near.sum() < MIN_POLY_POINTS:
-            return straight
-        coef = np.polyfit(pts[near, 1], pts[near, 0], 2)
-    c, a, b = coef
+    z, x = p[:, 1], p[:, 0]
+    c, a, b = np.polyfit(z, x, 2)
     if abs(2 * c) > MAX_CURVATURE:
         return straight
-    z, x = pts[near, 1], pts[near, 0]
+    # la parabola deve spiegare i punti molto meglio della retta, altrimenti e' rumore
     rss_lin = np.sum((x - np.polyval(np.polyfit(z, x, 1), z)) ** 2)
-    rss_quad = np.sum((x - np.polyval(coef, z)) ** 2)
-    if rss_quad > 0.7 * rss_lin:                       # the parabola must beat the line on the same points
+    rss_quad = np.sum((x - np.polyval([c, a, b], z)) ** 2)
+    if rss_quad > 0.7 * rss_lin:
         return straight
-    return dict(c=c, a=a, b=b, zr=(p[:, 1].min(), p[:, 1].max()))
+    return dict(c=float(c), a=float(a), b=float(b), zr=(float(z.min()), float(z.max())))
 
 
 # ---------------- disegno e prospettiva ----------------
@@ -410,6 +521,33 @@ def draw_line(img, M_inv, line_lft, line_rgt, alpha=0.35):
     return out
 
 
+def marking_support(img_tresh, road, a_ref):
+    """Supporto pesato della migliore linea candidata che sta DENTRO la strada (road_mask erosa di INTERIOR_ERODE_M).
+    I bordi della carreggiata restano fuori dalla maschera erosa: quello che rimane e' quasi solo vernice."""
+    k = int(round(INTERIOR_ERODE_M * PX_PER_M))
+    inner = cv2.erode((road > 0).astype(np.uint8) * 255, np.ones((2 * k + 1, 2 * k + 1), np.uint8))
+    d = points_in_meters(cv2.bitwise_and(img_tresh, inner))
+    p = np.column_stack((d["x"], d["z"]))
+    if len(p) < MIN_INLIERS:
+        return 0.0
+    cands = vote_candidates(p, a_ref) if a_ref is not None else []
+    if not cands:
+        cands = find_candidates(p, slope_ref=a_ref)
+    return max((c["w_inl"] for c in cands), default=0.0)
+
+
+def lane_from_masks(gl, gr, road):
+    """Stima senza marcature: bordi della maschera ego se ci sono entrambi, altrimenti corsia dalla sola road_mask.
+    Restituisce (sinistra, destra, nome) oppure None."""
+    if gl is not None and gr is not None:
+        mk = lambda l: dict(a=l["a"], b=l["b"], inliers=None, n_iter=0, stimata=True, source="lane")
+        return mk(gl), mk(gr), "no-marks:ego"
+    res = lane_from_road(road)
+    if res is not None:
+        return res[0], res[1], "no-marks:road"
+    return None
+
+
 # ---------------- funzione principale di fitting ----------------
 def lane_fitting(img_tresh, img, M_inv, guide=None):
 
@@ -418,36 +556,62 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
 
     gl, gr = guide_borders(guide)
     a_ref = road_direction(guide)                       # direzione della maschera (strada o corsia ego)
+    road = guide.get("road") if guide is not None else None
+    valid = guide.get("valid") if guide is not None else None
+    have_road = road is not None and valid is not None and road.any()
+
     cands = vote_candidates(pts, a_ref) if (USE_VOTING and a_ref is not None) else []
     if not cands:                                       # nessuna direzione o nessun picco: RANSAC come prima
         cands = find_candidates(pts, slope_ref=a_ref)
     if not cands and a_ref is not None:                 # rete di sicurezza: direzione sbagliata -> senza vincolo
         cands = find_candidates(pts)
-    pair = best_pair(cands, gl, gr)
-    hits = [any(abs(x_at(c) - x_at(g)) < GUIDE_TOL_M for c in cands) for g in (gl, gr) if g is not None]
-    odd_width = gl is not None and gr is not None and abs(x_at(gr) - x_at(gl) - LANE_WIDTH_M) > GUIDE_REJECT_M
-    trusted = all(hits) if odd_width else any(hits)
-    if pair is None and not trusted:    # guide unreliable: drop it (an odd-width mask needs both borders confirmed)
-        pair = best_pair(cands)
+
+    # ---- gate: ci sono marcature dentro la strada? Se no, si usa la stima dalle maschere ----
+    msup = marking_support(img_tresh, road, a_ref) if have_road else None
+    no_marks = msup is not None and msup < MARKING_MIN_SUPPORT
+    fallback = lane_from_masks(gl, gr, road) if no_marks else None
 
     ransac_sx = ransac_dx = None
     stimata = False
     sel = dict(left=None, right=None)
-    if pair is not None:
-        ransac_sx, ransac_dx = pair
-        sel = dict(left=_index(cands, pair[0]), right=_index(cands, pair[1]))
-    elif cands:
-        best = pick_anchor(cands, gl, gr)
-        ransac_sx, ransac_dx = missing_side_from_guide(best, guide) or missing_side(best)
-        sel["right" if x_at(best) > 0 else "left"] = _index(cands, best)
+    road_frac, alt_name = None, None
+
+    if fallback is not None:
+        ransac_sx, ransac_dx, alt_name = fallback
         stimata = True
+        if have_road:
+            road_frac = lane_road_frac(ransac_sx, ransac_dx, pts, road, valid)
+    else:
+        pair = best_pair(cands, gl, gr)
+        hits = [any(abs(x_at(c) - x_at(g)) < GUIDE_TOL_M for c in cands) for g in (gl, gr) if g is not None]
+        odd_width = gl is not None and gr is not None and abs(x_at(gr) - x_at(gl) - LANE_WIDTH_M) > GUIDE_REJECT_M
+        trusted = all(hits) if odd_width else any(hits)
+        if pair is None and not trusted:    # guide unreliable: drop it (an odd-width mask needs both borders confirmed)
+            pair = best_pair(cands)
+
+        if pair is not None:
+            ransac_sx, ransac_dx = pair
+            sel = dict(left=_index(cands, pair[0]), right=_index(cands, pair[1]))
+        elif cands:
+            best = pick_anchor(cands, gl, gr)
+            ransac_sx, ransac_dx = missing_side_from_guide(best, guide) or missing_side(best)
+            sel["right" if x_at(best) > 0 else "left"] = _index(cands, best)
+            stimata = True
+
+        # ---- verifica sulla road_mask: se la corsia scelta sta (quasi) tutta sulla strada non cambia nulla ----
+        if have_road:
+            road_frac = lane_road_frac(ransac_sx, ransac_dx, pts, road, valid) if (ransac_sx and ransac_dx) else 0.0
+            if road_frac < ROAD_OK_FRAC:
+                choice = pick_alternative(road_alternatives(cands, pair, gl, gr, road), road_frac, pts, road, valid)
+                if choice is not None:
+                    (alt_name, ransac_sx, ransac_dx, stimata, sel), road_frac = choice
 
     out = dict(points=pts_dict, pts=pts, candidates=cands, ransac_sx=ransac_sx, ransac_dx=ransac_dx,
-               stimata=stimata, sel=sel, guide=guide, slope_ref=a_ref)
+               stimata=stimata, sel=sel, guide=guide, slope_ref=a_ref, road_frac=road_frac, alt=alt_name,
+               marking_support=msup, no_marks=no_marks,
+               supports=sorted((c["w_inl"] for c in cands), reverse=True))   # diagnostic: weighted support of every candidate
     if ransac_sx and ransac_dx:
-        curved = [fit_boundary_poly(l, pts) for l in (ransac_sx, ransac_dx)]
-        if abs(curved[0]["c"] - curved[1]["c"]) > CURV_AGREE:     # curvature must be shared by both borders
-            curved = [dict(c=0.0, a=l["a"], b=l["b"], zr=Z_RANGE) for l in (ransac_sx, ransac_dx)]
+        curved = curved_pair(ransac_sx, ransac_dx, pts)
         out["overlay"] = draw_line(img, M_inv, *curved)
         pred = np.zeros(img.shape[:2], np.uint8)
         cv2.fillPoly(pred, [lane_polygon(*curved, M_inv)], 1)
