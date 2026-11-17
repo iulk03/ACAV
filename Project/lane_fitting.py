@@ -32,6 +32,11 @@ MIN_POLY_POINTS = 25         # min support points to fit a quadratic on a bounda
 MIN_POLY_SPAN_FRAC = 0.35        # support points must span at least this fraction of the BEV depth
 MAX_CURVATURE = 0.05            # 1/m: |kappa| above this (R < 20 m) is treated as a bad fit -> straight line
 CURV_AGREE = 0.01               # max |c_left - c_right| (x = c*z^2 + ...); otherwise both boundaries stay straight
+CURVE_BAND_M = 0.15             # band around the CURRENT model (line, then parabola) used to grow the support of a boundary along a curve
+CURVE_GROW_ITER = 4             # growth iterations (each one widens the z window by CURVE_GROW_STEP_M per side)
+CURVE_GROW_STEP_M = 2.0         # z window growth per side and per iteration (m)
+LOOKAHEAD_M = 10.0              # distance from the vehicle of the red target point on the centreline
+EGO_Z_M = 0.0                   # vehicle position along z
 
 # ---------------- parametri di scelta della coppia ----------------
 N_CANDIDATES = 5            # quante rette candidate cercare
@@ -357,11 +362,32 @@ def missing_side_from_guide(line, guide):
 
 
 # ---------------- frazione di corsia sulla strada + alternative ----------------
+def _straight(x):
+    return dict(c=0.0, a=x["a"], b=x["b"], zr=Z_RANGE)
+
+
+def _borrow_shape(ref, other):
+    """Boundary `other` (estimated or too short to give a curvature) rebuilt as a copy of the curved boundary `ref`,
+    shifted laterally so that it keeps its own position at Z_REF. The two borders of a lane share the curvature."""
+    d = x_at(other) - (ref["c"] * Z_REF ** 2 + ref["a"] * Z_REF + ref["b"])
+    return dict(c=ref["c"], a=ref["a"], b=ref["b"] + d, zr=ref["zr"])
+
+
 def curved_pair(l, r, pts):
     """Fit parabolico dei due bordi (logica diretta presa dal secondo file, con regola di curvatura condivisa)."""
-    curved = [fit_boundary_poly(x, pts) for x in (l, r)]
+    raw = (l, r)
+    curved = [fit_boundary_poly(x, pts) for x in raw]
+    for i in (0, 1):
+        if raw[i].get("stimata") and not raw[1 - i].get("stimata"):
+            other = curved[1 - i]
+            curved[i] = dict(
+                c=other["c"],
+                a=other["a"] + (raw[i]["a"] - raw[1 - i]["a"]),
+                b=other["b"] + (raw[i]["b"] - raw[1 - i]["b"]),
+                zr=other["zr"],
+            )
     if abs(curved[0]["c"] - curved[1]["c"]) > CURV_AGREE:     # curvature must be shared by both borders
-        curved = [dict(c=0.0, a=x["a"], b=x["b"], zr=Z_RANGE) for x in (l, r)]
+        curved = [dict(c=0.0, a=x["a"], b=x["b"], zr=Z_RANGE) for x in raw]
     return curved
 
 
@@ -473,21 +499,94 @@ def support_points(line, pts):
     return None
 
 
+def grow_support(p0, pts):
+    """Support of a boundary that follows the CURVE instead of the straight line.
+    The straight inliers (band 0.06 m) only cover the tangent segment of a curved line. Starting from them, the model
+    (a line first, a parabola as soon as the support is long enough) is refitted and the support is re-collected in a
+    band of CURVE_BAND_M around the model, widening the z window a little each time. Straight lines stay as they are
+    (the parabola is then rejected by the RSS test in fit_boundary_poly)."""
+    depth = Z_RANGE[1] - Z_RANGE[0]
+    zlo, zhi = float(p0[:, 1].min()), float(p0[:, 1].max())
+    a, b = np.polyfit(p0[:, 1], p0[:, 0], 1)
+    coef = np.array([0.0, a, b])
+    p = p0
+    for _ in range(CURVE_GROW_ITER):
+        zlo, zhi = max(Z_RANGE[0], zlo - CURVE_GROW_STEP_M), min(Z_RANGE[1], zhi + CURVE_GROW_STEP_M)
+        near = (pts[:, 1] >= zlo) & (pts[:, 1] <= zhi) & (np.abs(pts[:, 0] - np.polyval(coef, pts[:, 1])) <= CURVE_BAND_M)
+        q = pts[near]
+        if len(q) < MIN_POLY_POINTS:
+            break
+        if np.ptp(q[:, 1]) >= MIN_POLY_SPAN_FRAC * depth:
+            new = np.polyfit(q[:, 1], q[:, 0], 2)
+        else:
+            new = np.array([0.0, *np.polyfit(q[:, 1], q[:, 0], 1)])
+        if abs(2 * new[0]) > MAX_CURVATURE:              # implausible curvature: stop growing, keep the last good support
+            break
+        converged = len(q) == len(p) and np.allclose(new, coef, atol=1e-4)
+        p, coef = q, new
+        if converged:
+            break
+    return p
+
+
 def fit_boundary_poly(line, pts):
-    straight = dict(c=0.0, a=line["a"], b=line["b"], zr=Z_RANGE)
-    p = support_points(line, pts)
-    if p is None or len(p) < MIN_POLY_POINTS or np.ptp(p[:, 1]) < MIN_POLY_SPAN_FRAC * (Z_RANGE[1] - Z_RANGE[0]):
+    """Quadratic x = c*z^2 + a*z + b of one boundary. 'kind' tells why the result is what it is:
+      curved   -> parabola accepted
+      straight -> enough support, but the data do not justify a curvature (or it is implausible)
+      weak     -> estimated border / not enough support: no information about the curvature"""
+    straight = dict(c=0.0, a=line["a"], b=line["b"], zr=Z_RANGE, kind="weak")
+    p0 = support_points(line, pts)
+    if p0 is None or len(p0) < MIN_POLY_POINTS:
         return straight
+    p = grow_support(p0, pts)
+    if len(p) < MIN_POLY_POINTS or np.ptp(p[:, 1]) < MIN_POLY_SPAN_FRAC * (Z_RANGE[1] - Z_RANGE[0]):
+        return straight
+    straight["kind"] = "straight"
     z, x = p[:, 1], p[:, 0]
     c, a, b = np.polyfit(z, x, 2)
     if abs(2 * c) > MAX_CURVATURE:
         return straight
-    # la parabola deve spiegare i punti molto meglio della retta, altrimenti e' rumore
+    # the parabola must explain the points much better than a line, otherwise it is noise
     rss_lin = np.sum((x - np.polyval(np.polyfit(z, x, 1), z)) ** 2)
     rss_quad = np.sum((x - np.polyval([c, a, b], z)) ** 2)
     if rss_quad > 0.7 * rss_lin:
         return straight
-    return dict(c=float(c), a=float(a), b=float(b), zr=(float(z.min()), float(z.max())))
+    return dict(c=float(c), a=float(a), b=float(b), zr=(float(z.min()), float(z.max())), kind="curved", n=int(len(p)))
+
+
+# ---------------- centreline, curvature, lookahead ----------------
+def ego_centerline(curved):
+    """Centreline x = c*z^2 + a*z + b of the lane: mean of the two boundaries as they are drawn (parabola inside the
+    support, tangent outside), refitted with a quadratic over the whole BEV depth."""
+    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
+    x = 0.5 * (boundary_x(curved[0], z) + boundary_x(curved[1], z))
+    c, a, b = np.polyfit(z, x, 2)
+    return dict(c=float(c), a=float(a), b=float(b))
+
+
+def curvature_at(center, z):
+    """Signed curvature [1/m] of the centreline at depth z (positive = curving right) and radius [m]."""
+    slope = 2 * center["c"] * z + center["a"]
+    kappa = 2 * center["c"] / (1 + slope ** 2) ** 1.5
+    radius = 1.0 / abs(kappa) if abs(kappa) > 1e-6 else 1e6
+    return float(kappa), float(min(radius, 1e6))
+
+
+def lookahead_point(center, lookahead=LOOKAHEAD_M):
+    """First point of the centreline at distance >= lookahead from the vehicle (x=0, z=EGO_Z_M)."""
+    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 200)
+    x = center["c"] * z ** 2 + center["a"] * z + center["b"]
+    ok = np.flatnonzero(np.hypot(x, z - EGO_Z_M) >= lookahead)
+    i = int(ok[0]) if len(ok) else len(z) - 1
+    return float(x[i]), float(z[i])
+
+
+def draw_prediction(img, M_inv, center, target):
+    """Blue centreline and red lookahead dot on the image (in place)."""
+    cv2.polylines(img, [line_on_image(center, M_inv).astype(np.int32)], False, (0, 0, 255), 3, cv2.LINE_AA)
+    u, v = project_bev_xz([target[0]], [target[1]], M_inv)[0]
+    cv2.circle(img, (int(u), int(v)), 8, (255, 0, 0), -1, cv2.LINE_AA)
+    cv2.circle(img, (int(u), int(v)), 10, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 # ---------------- disegno e prospettiva ----------------
@@ -566,10 +665,12 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
     if not cands and a_ref is not None:                 # rete di sicurezza: direzione sbagliata -> senza vincolo
         cands = find_candidates(pts)
 
-    # ---- gate: ci sono marcature dentro la strada? Se no, si usa la stima dalle maschere ----
+    # ---- gate: ci sono marcature dentro la strada? Se no, si usa un cordolo forte o le maschere ----
     msup = marking_support(img_tresh, road, a_ref) if have_road else None
     no_marks = msup is not None and msup < MARKING_MIN_SUPPORT
-    fallback = lane_from_masks(gl, gr, road) if no_marks else None
+    if no_marks:
+        cands = [c for c in cands if c["w_inl"] >= MARKING_MIN_SUPPORT]
+    fallback = lane_from_masks(gl, gr, road) if (no_marks and not cands) else None
 
     ransac_sx = ransac_dx = None
     stimata = False
@@ -617,6 +718,11 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
         cv2.fillPoly(pred, [lane_polygon(*curved, M_inv)], 1)
         out["pred_mask"] = pred > 0                     # usata da main.py per l'IoU con la GT ego-lane
         out["curved"] = curved
+        center = ego_centerline(curved)
+        kappa, radius = curvature_at(center, Z_RANGE[0])
+        target = lookahead_point(center)
+        out.update(center=center, curvature=kappa, radius=radius, target=target)
+        draw_prediction(out["overlay"], M_inv, center, target)
     return out
 
 

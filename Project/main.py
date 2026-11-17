@@ -28,12 +28,12 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # 'w'    --> only wrongly detected images
 SINGLE = None
 TYPE = 2 # 0 = um, 1 = umm, 2 = uu
-ALL = True # True to process all the images (um, umm, uu)
+ALL = False # True to process all the images (um, umm, uu)
 DEBUG = not ALL and SINGLE is not None   # full debug images only when few images are processed
 
-wrong = {'um': [49, 76],
-        'umm': [16, 15],
-        'uu' : [1, 3, 5, 6, 7, 8, 9, 10, 13, 15, 16, 17, 23, 27, 28, 29, 30, 36, 37, 42, 49, 51, 54, 57, 83, 84, 85, 86, 87, 88, 89, 90, 93, 94, 96]}
+wrong = {'um': [0, 70, 85 , 87],
+        'umm': [20, 22, 23, 24],
+        'uu' : [69]}
 
 IOU_FAIL = 0.5      # um: below this ego-lane IoU an image is considered wrong
 ROAD_FAIL = 0.8     # umm / uu: below this on-road fraction an image is considered wrong
