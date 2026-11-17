@@ -151,8 +151,14 @@ def execute(img_idx, img_type):
 
 if ALL:
     for type, max_img_idx in list(OPTIONS.items()):
-        for idx in range(max_img_idx):
-            execute(idx, type)
+        if SINGLE is None:
+            for idx in range(max_img_idx):
+                execute(idx, type)
+        elif SINGLE == 'w':
+            for idx in wrong[type]:
+                execute(idx, type)
+        else:
+            execute(SINGLE, type)
 else:
     type, max_img_idx = list(OPTIONS.items())[TYPE] # depending which type of road we want to check
     if SINGLE is None:
