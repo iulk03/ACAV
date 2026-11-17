@@ -27,6 +27,7 @@ def read_calib(path):
                 calib[name.strip()] = np.array(values.split(), dtype=float)
     return calib
 
+
 def compute_trapezoid(calib, x_range=X_RANGE, z_range=Z_RANGE):
     P2 = calib["P2"].reshape(3, 4)
     R0_rect = calib["R0_rect"].reshape(3, 3)
@@ -47,10 +48,12 @@ def compute_trapezoid(calib, x_range=X_RANGE, z_range=Z_RANGE):
         show(x_range[0], z_range[1]),          
     ])
 
+
 def apply_roi(img, trapezoid):
     mask = np.zeros(img.shape[:2], dtype=np.uint8)
     cv2.fillPoly(mask, [trapezoid.astype(np.int32)], 255)   
     return cv2.bitwise_and(img, img, mask=mask)            
+
 
 def brid_eye_view(img, trapezoid, x_range=X_RANGE, z_range=Z_RANGE, px_per_m=PX_PER_M):
     width = int((x_range[1] - x_range[0]) * px_per_m)
@@ -100,6 +103,7 @@ def ego_mask_bev(img, M, valid_bev):
     cv2.drawContours(filled, cnts, -1, 255, cv2.FILLED)
     filled = cv2.medianBlur(filled, 15)
     return filled if (filled > 0).sum() >= EGO_MIN_AREA_PX else np.zeros_like(mask)
+
 
 def pick_guide_mask(ego_mask, road_mask):
     """Ego-lane mask if present and consistent with the road, otherwise the road mask."""
@@ -175,7 +179,6 @@ def lane_pipeline(path, img, out_path=None):
         road_keep = np.full_like(road_mask, 255)
 
     ego_mask = ego_mask_bev(img, M, valid_bev)
-    w = (ego_mask > 0).sum(1) / PX_PER_M
     guide = pick_guide_mask(ego_mask, road_mask)
     guide["bev"] = img_bird_eye
     guide["road"] = road_mask          # used by lane_fitting to check the chosen lane against the road
@@ -187,7 +190,8 @@ def lane_pipeline(path, img, out_path=None):
     steps.update(road_keep=road_keep, ego=ego_mask, final=img_thresh)
     if out_path is not None:
         plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path)
-    return M_inv, img_thresh, guide
+    return M, M_inv, img_thresh, guide
+
 
 def plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path=None):
     vis = img.copy()

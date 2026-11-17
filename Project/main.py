@@ -8,6 +8,7 @@ import numpy as np
 import net_classifier as nc
 import lane_fitting as lf
 import lane_pipeline as lp
+import obstacle_detection as od
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -28,7 +29,7 @@ if OUT_DIR.is_dir() and next(OUT_DIR.iterdir(), None) is None:
 # 'w'    --> only wrongly detected images
 SINGLE = None
 TYPE = 2 # 0 = um, 1 = umm, 2 = uu
-ALL = False # True to process all the images (um, umm, uu)
+ALL = True # True to process all the images (um, umm, uu)
 DEBUG = not ALL and SINGLE is not None   # full debug images only when few images are processed
 
 wrong = {'um': [0, 70, 85 , 87],
@@ -40,6 +41,9 @@ ROAD_FAIL = 0.8     # umm / uu: below this on-road fraction an image is consider
 scores = {}         # type -> [(img_idx, score)]
 marks = {}          # type -> [(img_idx, interior marking support)]
 supports = {}       # type -> [(img_idx, max candidate support)]  (diagnostic for the 'has markings' idea)
+
+# Inizializza detector COCO (torchvision) una sola volta
+detector = od.ObstacleDetector(conf=0.5)
 
 
 def ego_width_stats():
@@ -122,8 +126,15 @@ def execute(img_idx, img_type):
     img = cv2.cvtColor(cv2.imread(str(image_path)), cv2.COLOR_BGR2RGB)
     calib_path = ROOT / "training" / "calib" / f"{stem}.txt"
 
-    M_inv, thresh, guide = lp.lane_pipeline(calib_path, img, out_path=OUT_DIR / f"{stem}_bev.png" if DEBUG else None)
+    M, M_inv, thresh, guide = lp.lane_pipeline(calib_path, img, out_path=OUT_DIR / f"{stem}_bev.png" if DEBUG else None)
     out = lf.lane_fitting(thresh, img, M_inv, guide)
+
+    # ---- Obstacle detection con modelli COCO (torchvision) ----
+    raw_dets = detector.detect(img)
+    obstacles = od.evaluate_obstacles(raw_dets, M, curved=out.get("curved"))
+    out["obstacles"] = obstacles
+    in_lane_obs = [o for o in obstacles if o["in_ego_lane"]]
+
     if DEBUG:
         lf.plot_bev_debug(thresh, out, OUT_DIR / f"{stem}_candidates.png")
         lf.plot_candidates_thresh(thresh, out, OUT_DIR / f"{stem}_cands_thresh.png")
@@ -142,11 +153,21 @@ def execute(img_idx, img_type):
     src = (out.get("guide") or {}).get("source")
     iou_txt += f", guide: {src}, supp: [{', '.join(f'{s:.0f}' for s in sup[:3])}]"
 
+    obs_txt = f", obs: {len(obstacles)}"
+    if in_lane_obs:
+        closest = in_lane_obs[0]
+        obs_txt += f" [IN LANE: {closest['cls']} @ {closest['distance_m']:.1f}m]"
+
+    base_vis = out["overlay"] if "overlay" in out else img
+    final_vis = od.draw_obstacles(base_vis, obstacles)
+
     if "overlay" in out:
-        cv2.imwrite(str(OUT_DIR / f"{stem}_overlay.png"), cv2.cvtColor(out["overlay"], cv2.COLOR_RGB2BGR))
-        print(f"type: {img_type}, img: {img_idx}, ego found, estimated side: {out['stimata']}{iou_txt}")
+        cv2.imwrite(str(OUT_DIR / f"{stem}_overlay.png"), cv2.cvtColor(final_vis, cv2.COLOR_RGB2BGR))
+        print(f"type: {img_type}, img: {img_idx}, ego found, estimated side: {out['stimata']}{iou_txt}{obs_txt}")
     else:
-        print(f"type: {img_type}, img: {img_idx}, no lane found. Points: {len(out['pts'])}; candidates: {len(out['candidates'])}{iou_txt}")
+        if obstacles:
+            cv2.imwrite(str(OUT_DIR / f"{stem}_overlay.png"), cv2.cvtColor(final_vis, cv2.COLOR_RGB2BGR))
+        print(f"type: {img_type}, img: {img_idx}, no lane found. Points: {len(out['pts'])}; candidates: {len(out['candidates'])}{iou_txt}{obs_txt}")
 
 
 if ALL:
