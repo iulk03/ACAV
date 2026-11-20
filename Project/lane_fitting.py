@@ -22,7 +22,7 @@ VOTE_BIN_M = 0.1            # larghezza dei bin dell'istogramma della posizione 
 VOTE_MIN_ROWS = 20          # righe BEV distinte (a ~30 px/m: 20 righe ~ 0.7 m di linea) per avere una candidata
 VOTE_NMS_M = 0.3            # due candidate non possono stare piu' vicine di cosi'
 VOTE_BAND_M = 0.15          # semi-larghezza della banda di punti attorno al picco, usata per rifinire la retta
-VOTE_REFINE_TOL = 0.03      # la pendenza rifinita non puo' scostarsi di piu' di cosi' da quella della maschera
+VOTE_REFINE_TOL = 0.1      # la pendenza rifinita non puo' scostarsi di piu' di cosi' da quella della maschera
 VOTE_REFINE_SPAN_M = 4.0    # estensione minima in z dei punti per rifinire anche la pendenza (i tratteggi corti tengono quella della maschera)
 VOTE_REFINE_BAND_M = 0.08   # per rifinire la pendenza si usano solo i punti entro questa distanza dalla retta preliminare
 VOTE_WIDE_M = 0.35          # banda larga per misurare la rettilineita': una crepa sinuosa esce dalla banda stretta, una linea no
@@ -37,22 +37,24 @@ CURVE_GROW_ITER = 4             # growth iterations (each one widens the z windo
 CURVE_GROW_STEP_M = 2.0         # z window growth per side and per iteration (m)
 LOOKAHEAD_M = 10.0              # distance from the vehicle of the red target point on the centreline
 EGO_Z_M = 0.0                   # vehicle position along z
+CAM_MERGE_Z_M = 12.0            # distanza z entro cui la traiettoria allineata alla camera converge alla mezzeria corsia
+CAM_DRAW_START_Z_M = 4.5        # inizio disegno della traiettoria in avanti (dal bordo inferiore della camera)
 
 # ---------------- parametri di scelta della coppia ----------------
 N_CANDIDATES = 5            # quante rette candidate cercare
 Z_REF = 0.5 * (Z_RANGE[0] + Z_RANGE[1])   # z di riferimento per la posizione laterale
 LANE_W_MIN = 2.0            # larghezza minima plausibile della corsia (m)
-LANE_W_MAX = 5.5            # max plausible lane width (m): wide intersections
+LANE_W_MAX = 4.2            # max plausible lane width (m): wide intersections
 SLOPE_DELTA_MAX = 0.1       # differenza massima di pendenza tra le due rette
-W_CENTER = 20.0             # weak penalty for a lane not centred on the car
-W_WIDTH = 40.0              # penalty per metre away from LANE_WIDTH_M
+W_CENTER = 55.0             # weak penalty for a lane not centred on the car
+W_WIDTH = 120.0              # penalty per metre away from LANE_WIDTH_M
 LANE_WIDTH_M = 3.2          # larghezza di default per il ripiego
 MASK_EDGE_MARGIN_PX = 4     # border columns closer than this to the BEV side are fake (clipped by the ROI)
 MASK_MIN_ROWS = 40          # min number of rows with a valid border point
 
 
 CAR_TOL_M = 0.3             # car (x=0) must lie between the two lines, within this tolerance
-W_SUPPORT_CAP = 400.0       # cap on the weighted inlier support of a single line
+W_SUPPORT_CAP = 220.0       # cap on the weighted inlier support of a single line
 W_GUIDE = 80.0              # penalty per metre of disagreement with the guide border (lane guide only)
 GUIDE_TOL_M = 0.6           # max distance for a candidate to be considered "matching" a guide border
 GUIDE_REJECT_M = 1.0         # a pair whose border is further than this from the (lane) guide border is rejected outright
@@ -63,11 +65,28 @@ ROAD_OK_FRAC = 0.75         # sopra questa frazione di poligono sulla strada: la
 ROAD_GOOD_FRAC = 0.85       # un'alternativa "buona" deve avere almeno questa frazione sulla strada...
 ROAD_GAIN_GOOD = 0.10       # ...e migliorare di almeno questo rispetto alla scelta originale
 ROAD_GAIN_ANY = 0.20        # se nessuna arriva a ROAD_GOOD_FRAC: la migliore passa solo con questo guadagno
+ROAD_OK_FRAC_STRONG = 0.50  # soglia piu' bassa per una coppia di linee vere e ben supportate: non la si sostituisce con bordi maschera
+STRONG_PAIR_SUPPORT = 100.0 # supporto pesato minimo di ciascuna delle due linee per considerare la coppia "forte" (come MARKING_MIN_SUPPORT, NON calibrato)
+
+# ---------------- guida ego troppo larga ----------------
+EGO_GUIDE_MAX_W_M = 6.0     # se la maschera ego e' piu' larga (mediana per riga) non e' una corsia: la guida viene declassata a strada,
+                            # i suoi bordi non vengono usati e la direzione si cerca con RANSAC senza vincolo (NON calibrato)
 
 
 # ---------------- gate "ci sono marcature?" (solo vernice, lontano dai bordi strada) ----------------
 INTERIOR_ERODE_M = 0.8      # la road_mask viene erosa di questo: bordo asfalto/erba, cordoli e ombre di bordo escono
-MARKING_MIN_SUPPORT = 100.0 # supporto pesato minimo di una linea INTERNA alla strada; sotto -> niente marcature (NON calibrato!)
+MARKING_MIN_SUPPORT = 70.0  # supporto pesato minimo di una linea INTERNA alla strada; sotto -> niente marcature
+
+
+# ---------------- integrazione obstacle detection ----------------
+OBS_BORDER_TOL_PX = 2       # tolleranza (px) attorno a obs_body per ignorare i rientri della U-Net
+W_OBS_SLICE = 250.0         # forte penalita' se un bordo corsia attraversa fisicamente un veicolo
+W_OBS_PARKED = 120.0        # penalita' se una corsia troppo larga ingloba un veicolo laterale/parcheggiato
+OBS_CENTER_TOL_M = 0.9      # veicoli con |x| < questa soglia sono considerati nella corsia ego (non penalizzati)
+
+MAX_CAND_DIST_FROM_CAR = 3.5  # m — una striscia di corsia vera non può essere a più di 3.5 m dall'auto
+SHARP_TURN_SLOPE = 0.6        # sopra questa soglia la direzione dalla maschera non è affidabile per la BEV
+MAX_CENTER_OFFSET_M = 2.5     # la mezzeria corsia non può essere a più di 2.5 m dall'auto (sanity check traiettoria)
 
 
 # ---------------- da immagine binaria a coordinate strada ----------------
@@ -155,12 +174,12 @@ def x_car(line):
 
 
 def car_inside(l, r):
-    """Car (x=0) between the two lines, within CAR_TOL_M. Checked at z=0 AND at the nearest visible row (z=Z_RANGE[0]),
-    and accepted if either says the car is inside: a straight extrapolation to z=0 is wrong on a curved road
-    (um_000087: the line ends up at +0.8 m instead of -0.6 m), while z=7 is wrong on a straight but tilted one."""
-    xl = min(l["b"], l["a"] * Z_RANGE[0] + l["b"])
-    xr = max(r["b"], r["a"] * Z_RANGE[0] + r["b"])
-    return xl < CAR_TOL_M and xr > -CAR_TOL_M
+    z_near = Z_RANGE[0]
+    xl_near = l["a"] * z_near + l["b"]
+    xr_near = r["a"] * z_near + r["b"]
+    xl_mid = 0.5 * (l["b"] + xl_near)
+    xr_mid = 0.5 * (r["b"] + xr_near)
+    return (xl_near < CAR_TOL_M and xr_near > -CAR_TOL_M) and (xl_mid < CAR_TOL_M and xr_mid > -CAR_TOL_M)
 
 
 def near_weights(pts):
@@ -243,7 +262,29 @@ def vote_candidates(pts, a_ref, n=N_CANDIDATES):
     return cands
 
 
-def pair_score(l, r, gl=None, gr=None, reject=GUIDE_REJECT_M):
+def obstacle_penalty(l, r, obs_boxes):
+    """Penalizza coppie di bordi che attraversano fisicamente un ostacolo o inglobano veicoli laterali/parcheggiati."""
+    if not obs_boxes:
+        return 0.0
+    pen = 0.0
+    for box in obs_boxes:
+        zs = np.array([box["z_min"], 0.5 * (box["z_min"] + box["z_max"]), box["z_max"]])
+        xl = l["a"] * zs + l["b"]
+        xr = r["a"] * zs + r["b"]
+        x_obs_c = 0.5 * (box["x_min"] + box["x_max"])
+
+        # 1) Un bordo della corsia attraversa fisicamente l'impronta del veicolo
+        slices_l = np.any((box["x_min"] < xl) & (xl < box["x_max"]))
+        slices_r = np.any((box["x_min"] < xr) & (xr < box["x_max"]))
+        if slices_l or slices_r:
+            pen += W_OBS_SLICE
+        # 2) Veicolo laterale/parcheggiato interamente inglobato dentro una corsia troppo larga
+        elif np.all((xl <= x_obs_c) & (x_obs_c <= xr)) and abs(x_obs_c) >= OBS_CENTER_TOL_M:
+            pen += W_OBS_PARKED
+    return pen
+
+
+def pair_score(l, r, gl=None, gr=None, reject=GUIDE_REJECT_M, obs_boxes=()):
     xl, xr = x_at(l), x_at(r)
     larg = xr - xl                                     # width: same at any z for ~parallel lines
     guided = gl is not None and gr is not None
@@ -266,16 +307,17 @@ def pair_score(l, r, gl=None, gr=None, reject=GUIDE_REJECT_M):
         penalty += W_GUIDE * abs(xl - x_at(gl))
     if gr is not None:
         penalty += W_GUIDE * abs(xr - x_at(gr))
+    penalty += obstacle_penalty(l, r, obs_boxes)
     return support - penalty
 
 
-def best_pair(cands, gl=None, gr=None, reject=GUIDE_REJECT_M):
+def best_pair(cands, gl=None, gr=None, reject=GUIDE_REJECT_M, obs_boxes=()):
     best, best_s = None, -np.inf
     for l in cands:
         for r in cands:
             if l is r or x_at(l) >= x_at(r):
                 continue
-            s = pair_score(l, r, gl, gr, reject)
+            s = pair_score(l, r, gl, gr, reject, obs_boxes=obs_boxes)
             if s > best_s:
                 best, best_s = (l, r), s
     return best
@@ -303,9 +345,10 @@ def missing_side(line, width=LANE_WIDTH_M, flip=False):
     return line, est
 
 
-def mask_border_line(mask, side, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_RANGE):
+def mask_border_line(mask, side, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_RANGE, obs_body=None):
     """Fit x = a*z + b on the left/right border of a binary BEV mask (one point per row).
-    max_slope is wide (1.0): the road direction is not known yet and the road can be diagonal in the BEV."""
+    max_slope is wide (1.0): the road direction is not known yet and the road can be diagonal in the BEV.
+    Rows where the mask border touches `obs_body` are skipped so parked cars do not bend the border."""
     h, w = mask.shape
     pts = []
     for r in range(MARGIN_PX, h - MARGIN_PX):
@@ -315,17 +358,35 @@ def mask_border_line(mask, side, px_per_m=PX_PER_M, x_range=X_RANGE, z_range=Z_R
         c = cols[0] if side == "left" else cols[-1]
         if c <= MASK_EDGE_MARGIN_PX or c >= w - 1 - MASK_EDGE_MARGIN_PX:
             continue
+        if obs_body is not None:
+            c_lo = max(0, c - OBS_BORDER_TOL_PX)
+            c_hi = min(w, c + OBS_BORDER_TOL_PX + 1)
+            if obs_body[r, c_lo:c_hi].any():
+                continue
         pts.append((x_range[0] + c / px_per_m, z_range[1] - r / px_per_m))
     if len(pts) < MASK_MIN_ROWS:
         return None
     return ransac(np.array(pts), min_inliers=MASK_MIN_ROWS, max_slope=1.0)
 
 
+def guide_too_wide(guide):
+    """True se la guida e' una maschera ego (source='lane') piu' larga di EGO_GUIDE_MAX_W_M (larghezza mediana per riga).
+    Una maschera cosi' larga copre l'intera carreggiata (o sborda sul marciapiede): non e' una corsia, e i suoi bordi
+    e la sua direzione porterebbero il fitting fuori strada."""
+    if guide is None or guide.get("mask") is None or guide.get("source") != "lane":
+        return False
+    widths = (guide["mask"] > 0).sum(1) / PX_PER_M
+    widths = widths[widths > 0]
+    return len(widths) > 0 and float(np.median(widths)) > EGO_GUIDE_MAX_W_M
+
+
 def guide_borders(guide):
     """(left, right) border lines of the guide mask. Only if the guide is the ego-lane mask, else (None, None)."""
     if guide is None or guide.get("mask") is None or guide.get("source") != "lane":
         return None, None
-    gl, gr = mask_border_line(guide["mask"], "left"), mask_border_line(guide["mask"], "right")
+    obs_body = guide.get("obs_body")
+    gl = mask_border_line(guide["mask"], "left", obs_body=obs_body)
+    gr = mask_border_line(guide["mask"], "right", obs_body=obs_body)
     if gl is not None and gr is not None and x_at(gr) - x_at(gl) <= LANE_W_MIN:
         return None, None
     return gl, gr
@@ -336,12 +397,15 @@ def road_direction(guide):
     The mask is only used for the DIRECTION, not for the position: its borders can be off by ~0.5 m."""
     if guide is None or guide.get("mask") is None:
         return None
-    ls = [mask_border_line(guide["mask"], s) for s in ("left", "right")]
+    obs_body = guide.get("obs_body")
+    ls = [mask_border_line(guide["mask"], s, obs_body=obs_body) for s in ("left", "right")]
     ls = [l for l in ls if l is not None]
     if not ls:
         return None
     if len(ls) == 2 and abs(ls[0]["a"] - ls[1]["a"]) > DIR_AGREE:
-        ls = [max(ls, key=lambda l: l["inliers"].sum())]       # keep the better supported border
+        if guide.get("source") == "road":
+            return None
+        ls = [max(ls, key=lambda l: l["inliers"].sum())]
     w = [l["inliers"].sum() for l in ls]
     return float(np.average([l["a"] for l in ls], weights=w))
 
@@ -351,7 +415,8 @@ def missing_side_from_guide(line, guide):
     if guide is None or guide.get("mask") is None:
         return None
     known_is_right = x_at(line) > 0
-    edge = mask_border_line(guide["mask"], "left" if known_is_right else "right")
+    obs_body = guide.get("obs_body")
+    edge = mask_border_line(guide["mask"], "left" if known_is_right else "right", obs_body=obs_body)
     if edge is None:
         return None
     width = x_at(line) - x_at(edge) if known_is_right else x_at(edge) - x_at(line)
@@ -416,22 +481,39 @@ def lane_road_frac(l, r, pts, road, valid):
     return float((lane & (road > 0)).sum() / area)
 
 
-def lane_from_road(road, width=LANE_WIDTH_M):
-    """Corsia dalla sola road_mask. Strada stretta (<= LANE_W_MAX): carreggiata intera.
-    Strada larga: la parte destra, larga `width`. None se i bordi della maschera non si trovano."""
-    gl, gr = mask_border_line(road, "left"), mask_border_line(road, "right")
-    if gl is None or gr is None:
-        return None
+def lane_from_road(road, width=LANE_WIDTH_M, obs_body=None):
+    gl = mask_border_line(road, "left", obs_body=obs_body)
+    gr = mask_border_line(road, "right", obs_body=obs_body)
     mk = lambda l: dict(a=l["a"], b=l["b"], inliers=None, n_iter=0, stimata=True, source="road")
-    if x_at(gr) - x_at(gl) <= LANE_W_MAX:
-        return mk(gl), mk(gr)
-    right = mk(gr)
-    left = mk(gr)
-    left["b"] = gr["b"] - width
-    return left, right
+    if gl is not None and gr is not None:
+        road_w = x_at(gr) - x_at(gl)
+        if road_w <= LANE_W_MAX:
+            return mk(gl), mk(gr)
+        # Strada più larga di una corsia: scegliere il bordo più vicino all'auto (x=0)
+        if abs(x_at(gl)) < abs(x_at(gr)):
+            # Bordo sinistro più vicino → usa quello come riferimento
+            left = mk(gl)
+            right = mk(gl)
+            right["b"] = gl["b"] + width
+            return left, right
+        else:
+            # Bordo destro più vicino → usa quello come riferimento
+            left = mk(gr)
+            left["b"] = gr["b"] - width
+            return left, mk(gr)
+    if gr is not None:
+        right = mk(gr)
+        left = mk(gr)
+        left["b"] = gr["b"] - width
+        return left, right
+    if gl is not None:
+        left = mk(gl)
+        right = mk(gl)
+        right["b"] = gl["b"] + width
+        return left, right
+    return None
 
-
-def road_alternatives(cands, pair, gl, gr, road):
+def road_alternatives(cands, pair, gl, gr, road, obs_body=None, obs_boxes=()):
     """Alternative alla scelta originale, nell'ordine: (1) altre coppie valide, (2) una candidata con il lato
     mancante da bordo maschera / default / lato opposto, (3) corsia dalla sola road_mask.
     Ogni elemento: (nome, sinistra, destra, stimata, sel)."""
@@ -445,14 +527,17 @@ def road_alternatives(cands, pair, gl, gr, road):
                 continue
             if pair is not None and l is pair[0] and r is pair[1]:
                 continue
-            s = max(pair_score(l, r, gl, gr), pair_score(l, r))
+            s = max(
+                pair_score(l, r, gl, gr, obs_boxes=obs_boxes),
+                pair_score(l, r, obs_boxes=obs_boxes),
+            )
             if np.isfinite(s):
                 pairs.append((s, i, j))
     for s, i, j in sorted(pairs, reverse=True):
         alts.append(("pair", cands[i], cands[j], False, dict(left=i, right=j)))
 
     # 2) candidata singola, lato mancante in tre modi
-    road_guide = dict(mask=road, source="road")
+    road_guide = dict(mask=road, source="road", obs_body=obs_body)
     for i in sorted(range(len(cands)), key=lambda k: -cands[k]["w_inl"]):
         c = cands[i]
         side = "right" if x_at(c) > 0 else "left"
@@ -465,22 +550,29 @@ def road_alternatives(cands, pair, gl, gr, road):
                 alts.append((name, res[0], res[1], True, dict(sel)))
 
     # 3) solo road_mask
-    res = lane_from_road(road)
+    res = lane_from_road(road, obs_body=obs_body)
     if res is not None:
         alts.append(("road-only", res[0], res[1], True, dict(left=None, right=None)))
     return alts
 
 
-def pick_alternative(alts, f0, pts, road, valid):
+def pick_alternative(alts, f0, pts, road, valid, obs_boxes=()):
     """Prima alternativa (in ordine) con frac >= ROAD_GOOD_FRAC e guadagno >= ROAD_GAIN_GOOD.
-    Se non c'e': la migliore in assoluto, solo se il guadagno e' >= ROAD_GAIN_ANY. Altrimenti None."""
-    scored = [(lane_road_frac(a[1], a[2], pts, road, valid), a) for a in alts]
-    for f, a in scored:
-        if f >= ROAD_GOOD_FRAC and f - f0 >= ROAD_GAIN_GOOD:
+    Se non c'e': la migliore in assoluto, solo se il guadagno e' >= ROAD_GAIN_ANY. Altrimenti None.
+    Penalizza leggermente le alternative che attraversano o inglobano veicoli laterali."""
+    scored = []
+    for a in alts:
+        f = lane_road_frac(a[1], a[2], pts, road, valid)
+        obs_pen = obstacle_penalty(a[1], a[2], obs_boxes)
+        f_eff = f - 0.25 * (obs_pen / W_OBS_SLICE)
+        scored.append((f, f_eff, a))
+
+    for f, f_eff, a in scored:
+        if f >= ROAD_GOOD_FRAC and f_eff - f0 >= ROAD_GAIN_GOOD:
             return a, f
     if scored:
-        f, a = max(scored, key=lambda t: t[0])           # a parita' vince la prima in ordine
-        if f - f0 >= ROAD_GAIN_ANY:
+        f, f_eff, a = max(scored, key=lambda t: t[1])     # a parita' vince la prima in ordine
+        if f_eff - f0 >= ROAD_GAIN_ANY:
             return a, f
     return None
 
@@ -554,39 +646,86 @@ def fit_boundary_poly(line, pts):
     return dict(c=float(c), a=float(a), b=float(b), zr=(float(z.min()), float(z.max())), kind="curved", n=int(len(p)))
 
 
-# ---------------- centreline, curvature, lookahead ----------------
-def ego_centerline(curved):
-    """Centreline x = c*z^2 + a*z + b of the lane: mean of the two boundaries as they are drawn (parabola inside the
-    support, tangent outside), refitted with a quadratic over the whole BEV depth."""
+# ---------------- centreline (che parte dalla camera), curvature, lookahead ----------------
+def ego_centerline(curved, z_merge=CAM_MERGE_Z_M):
+    """Traiettoria centrale che parte dalla camera in (x=0, z=0, dx/dz=0) e si raccorda
+    dolcemente alla mezzeria geometrica della corsia entro `z_merge`."""
     z = np.linspace(Z_RANGE[0], Z_RANGE[1], 100)
     x = 0.5 * (boundary_x(curved[0], z) + boundary_x(curved[1], z))
-    c, a, b = np.polyfit(z, x, 2)
-    return dict(c=float(c), a=float(a), b=float(b))
+    c_l, a_l, b_l = [float(v) for v in np.polyfit(z, x, 2)]
+
+    # Posizione e pendenza della mezzeria corsia al punto di raccordo z_merge
+    zm = float(z_merge)
+    xm = c_l * zm ** 2 + a_l * zm + b_l
+    sm = 2.0 * c_l * zm + a_l
+
+    # Cubica di Hermite x(z) = d*z^3 + c*z^2 con x(0)=0, x'(0)=0, x(zm)=xm, x'(zm)=sm
+    c_h = (3.0 * xm - sm * zm) / (zm ** 2)
+    d_h = (sm * zm - 2.0 * xm) / (zm ** 3)
+    return dict(
+        d=float(d_h),
+        c=float(c_h),
+        a=0.0,
+        b=0.0,
+        zm=zm,
+        lane_c=c_l,
+        lane_a=a_l,
+        lane_b=b_l,
+    )
+
+
+def eval_centerline(center, z):
+    """Valuta la traiettoria che parte dalla camera per un array o scalare z."""
+    z_arr = np.asarray(z, dtype=float)
+    zm = center.get("zm")
+    if zm is None:
+        return center["c"] * z_arr ** 2 + center["a"] * z_arr + center["b"]
+    d = center.get("d", 0.0)
+    x_hermite = d * z_arr ** 3 + center["c"] * z_arr ** 2 + center["a"] * z_arr + center["b"]
+    x_lane = center["lane_c"] * z_arr ** 2 + center["lane_a"] * z_arr + center["lane_b"]
+    return np.where(z_arr <= zm, x_hermite, x_lane)
 
 
 def curvature_at(center, z):
-    """Signed curvature [1/m] of the centreline at depth z (positive = curving right) and radius [m]."""
-    slope = 2 * center["c"] * z + center["a"]
-    kappa = 2 * center["c"] / (1 + slope ** 2) ** 1.5
+    """Signed curvature [1/m] of the trajectory at depth z (positive = curving right) and radius [m]."""
+    zm = center.get("zm")
+    if zm is not None and z <= zm:
+        d = center.get("d", 0.0)
+        slope = 3.0 * d * z ** 2 + 2.0 * center["c"] * z + center["a"]
+        d2x = 6.0 * d * z + 2.0 * center["c"]
+    elif zm is not None:
+        slope = 2.0 * center["lane_c"] * z + center["lane_a"]
+        d2x = 2.0 * center["lane_c"]
+    else:
+        slope = 2.0 * center["c"] * z + center["a"]
+        d2x = 2.0 * center["c"]
+    kappa = d2x / (1.0 + slope ** 2) ** 1.5
     radius = 1.0 / abs(kappa) if abs(kappa) > 1e-6 else 1e6
     return float(kappa), float(min(radius, 1e6))
 
 
 def lookahead_point(center, lookahead=LOOKAHEAD_M):
-    """First point of the centreline at distance >= lookahead from the vehicle (x=0, z=EGO_Z_M)."""
-    z = np.linspace(Z_RANGE[0], Z_RANGE[1], 200)
-    x = center["c"] * z ** 2 + center["a"] * z + center["b"]
+    """First point of the camera-aligned centreline at distance >= lookahead from the vehicle (x=0, z=EGO_Z_M)."""
+    z = np.linspace(CAM_DRAW_START_Z_M, Z_RANGE[1], 250)
+    x = eval_centerline(center, z)
     ok = np.flatnonzero(np.hypot(x, z - EGO_Z_M) >= lookahead)
     i = int(ok[0]) if len(ok) else len(z) - 1
     return float(x[i]), float(z[i])
 
 
 def draw_prediction(img, M_inv, center, target):
-    """Blue centreline and red lookahead dot on the image (in place)."""
-    cv2.polylines(img, [line_on_image(center, M_inv).astype(np.int32)], False, (0, 0, 255), 3, cv2.LINE_AA)
+    """Blue centreline starting from the bottom edge of the camera and red lookahead dot on the image (in place)."""
+    z = np.linspace(CAM_DRAW_START_Z_M, Z_RANGE[1], 300)
+    x = eval_centerline(center, z)
+    pts_uv = project_bev_xz(x, z, M_inv)
+    h, w = img.shape[:2]
+    inside = (pts_uv[:, 0] >= 0) & (pts_uv[:, 0] < w) & (pts_uv[:, 1] >= 0) & (pts_uv[:, 1] < h)
+    if inside.sum() >= 2:
+        cv2.polylines(img, [pts_uv[inside].astype(np.int32)], False, (0, 0, 255), 3, cv2.LINE_AA)
     u, v = project_bev_xz([target[0]], [target[1]], M_inv)[0]
-    cv2.circle(img, (int(u), int(v)), 8, (255, 0, 0), -1, cv2.LINE_AA)
-    cv2.circle(img, (int(u), int(v)), 10, (255, 255, 255), 1, cv2.LINE_AA)
+    if 0 <= u < w and 0 <= v < h:
+        cv2.circle(img, (int(u), int(v)), 8, (255, 0, 0), -1, cv2.LINE_AA)
+        cv2.circle(img, (int(u), int(v)), 10, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 # ---------------- disegno e prospettiva ----------------
@@ -620,11 +759,14 @@ def draw_line(img, M_inv, line_lft, line_rgt, alpha=0.35):
     return out
 
 
-def marking_support(img_tresh, road, a_ref):
+def marking_support(img_tresh, road, a_ref, obs_ground=None):
     """Supporto pesato della migliore linea candidata che sta DENTRO la strada (road_mask erosa di INTERIOR_ERODE_M).
-    I bordi della carreggiata restano fuori dalla maschera erosa: quello che rimane e' quasi solo vernice."""
+    I bordi della carreggiata restano fuori dalla maschera erosa: quello che rimane e' quasi solo vernice.
+    Esclude anche l'impronta a terra degli ostacoli rilevati."""
     k = int(round(INTERIOR_ERODE_M * PX_PER_M))
     inner = cv2.erode((road > 0).astype(np.uint8) * 255, np.ones((2 * k + 1, 2 * k + 1), np.uint8))
+    if obs_ground is not None and obs_ground.any():
+        inner = cv2.bitwise_and(inner, cv2.bitwise_not(obs_ground))
     d = points_in_meters(cv2.bitwise_and(img_tresh, inner))
     p = np.column_stack((d["x"], d["z"]))
     if len(p) < MIN_INLIERS:
@@ -635,13 +777,13 @@ def marking_support(img_tresh, road, a_ref):
     return max((c["w_inl"] for c in cands), default=0.0)
 
 
-def lane_from_masks(gl, gr, road):
+def lane_from_masks(gl, gr, road, obs_body=None):
     """Stima senza marcature: bordi della maschera ego se ci sono entrambi, altrimenti corsia dalla sola road_mask.
     Restituisce (sinistra, destra, nome) oppure None."""
     if gl is not None and gr is not None:
         mk = lambda l: dict(a=l["a"], b=l["b"], inliers=None, n_iter=0, stimata=True, source="lane")
         return mk(gl), mk(gr), "no-marks:ego"
-    res = lane_from_road(road)
+    res = lane_from_road(road, obs_body=obs_body)
     if res is not None:
         return res[0], res[1], "no-marks:road"
     return None
@@ -653,10 +795,20 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
     pts_dict = points_in_meters(img_tresh)
     pts = np.column_stack((pts_dict["x"], pts_dict["z"]))
 
+    ego_wide = guide_too_wide(guide)
+    if ego_wide:                                        # maschera ego troppo larga: declassata a guida "road", niente bordi ne' direzione
+        road_m = guide.get("road")
+        guide = {**guide, "source": "road", "mask": road_m if (road_m is not None and road_m.any()) else None}
     gl, gr = guide_borders(guide)
-    a_ref = road_direction(guide)                       # direzione della maschera (strada o corsia ego)
+    a_ref = None if ego_wide else road_direction(guide)  # direzione della maschera (strada o corsia ego)
+    # Curva troppo stretta: la BEV distorce troppo, la direzione dalla maschera non è affidabile
+    if a_ref is not None and abs(a_ref) > SHARP_TURN_SLOPE:
+        a_ref = None
     road = guide.get("road") if guide is not None else None
     valid = guide.get("valid") if guide is not None else None
+    obs_body = guide.get("obs_body") if guide is not None else None
+    obs_ground = guide.get("obs_ground") if guide is not None else None
+    obs_boxes = guide.get("obs_boxes", ()) if guide is not None else ()
     have_road = road is not None and valid is not None and road.any()
 
     cands = vote_candidates(pts, a_ref) if (USE_VOTING and a_ref is not None) else []
@@ -665,12 +817,22 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
     if not cands and a_ref is not None:                 # rete di sicurezza: direzione sbagliata -> senza vincolo
         cands = find_candidates(pts)
 
+    # Filtrare candidate troppo lontane dal veicolo quando la guida ego è affidabile
+    if guide is not None and guide.get("source") == "lane" and not ego_wide and cands:
+        cands = [c for c in cands if abs(x_at(c)) <= MAX_CAND_DIST_FROM_CAR]
+
     # ---- gate: ci sono marcature dentro la strada? Se no, si usa un cordolo forte o le maschere ----
-    msup = marking_support(img_tresh, road, a_ref) if have_road else None
-    no_marks = msup is not None and msup < MARKING_MIN_SUPPORT
+    msup = marking_support(img_tresh, road, a_ref, obs_ground=obs_ground) if have_road else None
+    min_mark_thr = MARKING_MIN_SUPPORT
+    if have_road and obs_ground is not None and obs_ground.any():
+        visible_frac = float(((road > 0) & (obs_ground == 0)).sum() / (road > 0).sum())
+        min_mark_thr = MARKING_MIN_SUPPORT * float(np.clip(visible_frac, 0.4, 1.0))
+    no_marks = msup is not None and msup < min_mark_thr
     if no_marks:
-        cands = [c for c in cands if c["w_inl"] >= MARKING_MIN_SUPPORT]
-    fallback = lane_from_masks(gl, gr, road) if (no_marks and not cands) else None
+        for c in cands:
+            c["w_inl"] *= 0.5   # declassa ma non elimina: evita di buttare tutto e ricadere su maschere imprecise
+        cands = [c for c in cands if c["w_inl"] >= min_mark_thr * 0.5]
+    fallback = lane_from_masks(gl, gr, road, obs_body=obs_body) if (no_marks and not cands) else None
 
     ransac_sx = ransac_dx = None
     stimata = False
@@ -683,33 +845,49 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
         if have_road:
             road_frac = lane_road_frac(ransac_sx, ransac_dx, pts, road, valid)
     else:
-        pair = best_pair(cands, gl, gr)
+        pair = best_pair(cands, gl, gr, obs_boxes=obs_boxes)
         hits = [any(abs(x_at(c) - x_at(g)) < GUIDE_TOL_M for c in cands) for g in (gl, gr) if g is not None]
         odd_width = gl is not None and gr is not None and abs(x_at(gr) - x_at(gl) - LANE_WIDTH_M) > GUIDE_REJECT_M
         trusted = all(hits) if odd_width else any(hits)
         if pair is None and not trusted:    # guide unreliable: drop it (an odd-width mask needs both borders confirmed)
-            pair = best_pair(cands)
+            pair = best_pair(cands, obs_boxes=obs_boxes)
 
         if pair is not None:
             ransac_sx, ransac_dx = pair
             sel = dict(left=_index(cands, pair[0]), right=_index(cands, pair[1]))
         elif cands:
             best = pick_anchor(cands, gl, gr)
-            ransac_sx, ransac_dx = missing_side_from_guide(best, guide) or missing_side(best)
+            result = missing_side_from_guide(best, guide)
+            if result is None and gl is not None and gr is not None:
+                # Usa il bordo della maschera ego dal lato mancante
+                known_is_right = x_at(best) > 0
+                edge = gl if known_is_right else gr
+                width_check = abs(x_at(best) - x_at(edge))
+                if LANE_W_MIN < width_check < LANE_W_MAX:
+                    est = dict(a=edge["a"], b=edge["b"], inliers=None, n_iter=0, stimata=True, source="lane")
+                    result = (est, best) if known_is_right else (best, est)
+            if result is None:
+                result = missing_side(best)
+            ransac_sx, ransac_dx = result
             sel["right" if x_at(best) > 0 else "left"] = _index(cands, best)
             stimata = True
 
         # ---- verifica sulla road_mask: se la corsia scelta sta (quasi) tutta sulla strada non cambia nulla ----
         if have_road:
             road_frac = lane_road_frac(ransac_sx, ransac_dx, pts, road, valid) if (ransac_sx and ransac_dx) else 0.0
-            if road_frac < ROAD_OK_FRAC:
-                choice = pick_alternative(road_alternatives(cands, pair, gl, gr, road), road_frac, pts, road, valid)
+            # coppia di linee vere (non stimate) e ben supportate: la si sostituisce solo se la road_mask la contraddice nettamente
+            strong_pair = (pair is not None and ransac_sx is pair[0] and ransac_dx is pair[1]
+                           and min(pair[0]["w_inl"], pair[1]["w_inl"]) >= STRONG_PAIR_SUPPORT)
+            ok_frac = ROAD_OK_FRAC_STRONG if strong_pair else ROAD_OK_FRAC
+            if road_frac < ok_frac:
+                alts = road_alternatives(cands, pair, gl, gr, road, obs_body=obs_body, obs_boxes=obs_boxes)
+                choice = pick_alternative(alts, road_frac, pts, road, valid, obs_boxes=obs_boxes)
                 if choice is not None:
                     (alt_name, ransac_sx, ransac_dx, stimata, sel), road_frac = choice
 
     out = dict(points=pts_dict, pts=pts, candidates=cands, ransac_sx=ransac_sx, ransac_dx=ransac_dx,
                stimata=stimata, sel=sel, guide=guide, slope_ref=a_ref, road_frac=road_frac, alt=alt_name,
-               marking_support=msup, no_marks=no_marks,
+               marking_support=msup, no_marks=no_marks, ego_too_wide=ego_wide,
                supports=sorted((c["w_inl"] for c in cands), reverse=True))   # diagnostic: weighted support of every candidate
     if ransac_sx and ransac_dx:
         curved = curved_pair(ransac_sx, ransac_dx, pts)
@@ -722,7 +900,13 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
         kappa, radius = curvature_at(center, Z_RANGE[0])
         target = lookahead_point(center)
         out.update(center=center, curvature=kappa, radius=radius, target=target)
-        draw_prediction(out["overlay"], M_inv, center, target)
+        # Sanity check: se la mezzeria corsia è troppo lontana dall'auto la predizione non è affidabile
+        center_x_at_ref = 0.5 * (boundary_x(curved[0], np.array([Z_REF]))[0]
+                                + boundary_x(curved[1], np.array([Z_REF]))[0])
+        if abs(center_x_at_ref) <= MAX_CENTER_OFFSET_M:
+            draw_prediction(out["overlay"], M_inv, center, target)
+        else:
+            out["center_rejected"] = True
     return out
 
 
@@ -791,6 +975,9 @@ def plot_candidates_thresh(img_tresh, out, out_path=None):
     if guide is not None and guide.get("mask") is not None:
         ax.contour((guide["mask"] > 0).astype(float), levels=[0.5], colors="white", linewidths=1.5, extent=(X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1]), origin="upper")
         ax.plot([], [], color="white", label=f"guide mask ({guide['source']})")
+    if guide is not None and guide.get("obs_ground") is not None and guide["obs_ground"].any():
+        ax.contour((guide["obs_ground"] > 0).astype(float), levels=[0.5], colors="orange", linewidths=1.5, extent=(X_RANGE[0], X_RANGE[1], Z_RANGE[0], Z_RANGE[1]), origin="upper")
+        ax.plot([], [], color="orange", label="obstacle footprint")
 
     # reference direction taken from the mask (magenta dotted, drawn through the car position)
     a_ref = out.get("slope_ref")

@@ -18,8 +18,28 @@ COCO_ROAD_CLASSES = {
     8: "truck",
 }
 
-LANE_MARGIN_M = 0.25        # tolleranza laterale (m) oltre i bordi corsia
+# Dimensioni fisiche effettive (m) per costruire l'impronta a terra in BEV senza sovrastime
+CLASS_LENGTH_M = {
+    1: 0.6,   # person
+    2: 1.7,   # bicycle
+    3: 4.0,   # car
+    4: 1.9,   # motorcycle
+    6: 8.5,   # bus
+    8: 7.5,   # truck
+}
+
+CLASS_WIDTH_M = {
+    1: 0.6,   # person
+    2: 0.7,   # bicycle
+    3: 1.85,  # car
+    4: 0.8,   # motorcycle
+    6: 2.5,   # bus
+    8: 2.5,   # truck
+}
+
+LANE_MARGIN_M = 0.05        # tolleranza laterale minima (m) sui bordi corsia
 MAX_OBS_Z_M = 45.0          # distanza massima (m) oltre la quale ignorare gli ostacoli
+BODY_LOWER_FRAC = 0.45      # frazione inferiore del bbox 2D (zona ruote/paraurti a contatto col suolo)
 
 
 class ObstacleDetector:
@@ -67,15 +87,107 @@ def image_to_bev_xz(uv_points, M):
     return x, z
 
 
+def _tight_ground_footprint(det, M, lat_margin_m=0.0):
+    """
+    Calcola i limiti reali a terra (x_min, x_max, z_front, z_back) riducendo il box
+    all'effettiva larghezza e lunghezza del veicolo (senza sovrastime prospettiche).
+    """
+    x1, y1, x2, y2 = det["box"]
+    xs, zs = image_to_bev_xz([(x1, y2), (x2, y2)], M)
+    z_front = float(np.mean(zs))
+    length_m = CLASS_LENGTH_M.get(det["cls_id"], 4.0)
+    max_width_m = CLASS_WIDTH_M.get(det["cls_id"], 1.85)
+    z_back = z_front + length_m
+
+    x_lo = float(min(xs))
+    x_hi = float(max(xs))
+    raw_w = x_hi - x_lo
+    x_c = 0.5 * (x_lo + x_hi)
+
+    # Se il bbox 2D visto di scorcio proietta una larghezza maggiore dell'auto reale,
+    # riduce l'impronta alla larghezza fisica effettiva ancorandola al lato esterno.
+    if raw_w > max_width_m:
+        if x_c > 0.5:
+            x_lo = x_hi - max_width_m
+        elif x_c < -0.5:
+            x_hi = x_lo + max_width_m
+        else:
+            x_lo = x_c - 0.5 * max_width_m
+            x_hi = x_c + 0.5 * max_width_m
+
+    return x_lo - lat_margin_m, x_hi + lat_margin_m, z_front, z_back
+
+
+def build_obstacle_bev_masks(detections, M, bev_shape, img_shape, pad_px=0, lat_margin_m=0.0):
+    """
+    Costruisce le rappresentazioni BEV ridotte all'effettiva area a terra degli ostacoli:
+      - obs_body_bev   : uint8 (H_bev, W_bev), solo la fascia inferiore a contatto col suolo
+                         warpata in BEV (evita di proiettare il tetto dell'auto sull'asfalto
+                         cancellando le strisce della corsia e generando falsi negativi).
+      - obs_ground_bev : uint8 (H_bev, W_bev), impronta fisica effettiva a terra.
+      - obs_boxes      : lista di dict con limiti reali a terra (x_min, x_max, z_min, z_max, cls).
+    """
+    h_bev, w_bev = bev_shape
+    h_img, w_img = img_shape[:2]
+    obs_body_img = np.zeros((h_img, w_img), dtype=np.uint8)
+    obs_ground_bev = np.zeros((h_bev, w_bev), dtype=np.uint8)
+    obs_boxes = []
+
+    if not detections:
+        return np.zeros((h_bev, w_bev), dtype=np.uint8), obs_ground_bev, obs_boxes
+
+    for det in detections:
+        x1, y1, x2, y2 = det["box"]
+
+        # 1) Maschera 2D ristretta alla sola fascia inferiore (ruote/paraurti), senza padding
+        y_contact_top = y2 - BODY_LOWER_FRAC * (y2 - y1)
+        ix1 = max(0, int(round(x1)) - pad_px)
+        iy1 = max(0, int(round(y_contact_top)) - pad_px)
+        ix2 = min(w_img, int(round(x2)) + pad_px)
+        iy2 = min(h_img, int(round(y2)) + pad_px)
+        if ix2 > ix1 and iy2 > iy1:
+            obs_body_img[iy1:iy2, ix1:ix2] = 255
+
+        # 2) Impronta fisica effettiva a terra (larghezza e lunghezza reali del veicolo)
+        x_min, x_max, z_front, z_back = _tight_ground_footprint(det, M, lat_margin_m=lat_margin_m)
+
+        if z_back < Z_RANGE[0] or z_front > Z_RANGE[1]:
+            continue
+        if x_max < X_RANGE[0] or x_min > X_RANGE[1]:
+            continue
+
+        z_min = max(Z_RANGE[0], z_front)
+        z_max = min(Z_RANGE[1], z_back)
+        if z_min >= z_max:
+            continue
+
+        obs_boxes.append(dict(
+            x_min=x_min,
+            x_max=x_max,
+            z_min=z_min,
+            z_max=z_max,
+            cls=det["cls"],
+        ))
+
+        c1 = int(np.clip((x_min - X_RANGE[0]) * PX_PER_M, 0, w_bev - 1))
+        c2 = int(np.clip((x_max - X_RANGE[0]) * PX_PER_M, 0, w_bev - 1))
+        r1 = int(np.clip((Z_RANGE[1] - z_max) * PX_PER_M, 0, h_bev - 1))
+        r2 = int(np.clip((Z_RANGE[1] - z_min) * PX_PER_M, 0, h_bev - 1))
+        if c2 > c1 and r2 > r1:
+            obs_ground_bev[r1:r2 + 1, c1:c2 + 1] = 255
+
+    obs_body_bev = cv2.warpPerspective(obs_body_img, M, (w_bev, h_bev), flags=cv2.INTER_NEAREST)
+    return obs_body_bev, obs_ground_bev, obs_boxes
+
+
 def evaluate_obstacles(detections, M, curved=None, margin_m=LANE_MARGIN_M):
     """
     Calcola posizione (x, z), distanza dall'ego vehicle e verifica se l'ostacolo
-    ricade all'interno della corsia predetta (`curved`).
+    ricade effettivamente all'interno della corsia predetta (`curved`).
     """
     if not detections:
         return []
 
-    # Punto di contatto a terra = centro del lato inferiore del bounding box
     feet_uv = [((d["box"][0] + d["box"][2]) * 0.5, d["box"][3]) for d in detections]
     xs, zs = image_to_bev_xz(feet_uv, M)
 

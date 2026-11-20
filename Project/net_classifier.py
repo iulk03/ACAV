@@ -1,6 +1,9 @@
 """
 Pixel-wise road / non-road segmentation in the bird-eye view with a small U-Net (ResNet18 encoder).
 Output saved in road_net.pt file.
+
+BDD100K (Kaggle): nc.train_road() trains the road mask on BDD100K and saves road_net.pt in /kaggle/working.
+(train() is the old KITTI/bird-eye-view training: it needs data_road/ and lane_pipeline.)
 """
 import glob
 from pathlib import Path
@@ -18,15 +21,18 @@ import matplotlib.pyplot as plt
 
 BASE_DIR = Path(__file__).resolve().parent
 ROOT = BASE_DIR / "data_road"
-NET_PATH = BASE_DIR / "road_net.pt"
+OUT_DIR = Path("/kaggle/working") if Path("/kaggle/working").is_dir() else BASE_DIR   # script folder is read-only on Kaggle
+NET_PATH = OUT_DIR / "road_net.pt"
 
 ROAD_THR = 0.5       # threshold on the road probability
 CHROMA_MIN = 40.0    # colour gradient threshold (OpenCV Lab, Sobel 3x3)
 BDD_DIR = Path("/kaggle/input/datasets/solesensei/solesensei_bdd100k")
-EGO_PATH = Path("ego_net.pt")                    # cwd = /kaggle/working, shows up in the Output tab
+EGO_PATH = NET_PATH                              # BDD training writes road_net.pt (shows up in the Output tab)
 IMG_SIZE = (416, 128)      # (W, H) network input, KITTI-like aspect (3.25)
 CROP = (230, 618)          # BDD rows with a KITTI-like field of view (to be checked visually)
 SEED = 0
+ONLY_DAYTIME = True                 # keep only attributes.timeofday == "daytime"
+EXCLUDE_WEATHER = {"rainy"}         # attributes.weather values to drop (BDD: clear, overcast, partly cloudy, rainy, snowy, foggy, undefined)
 import torch
 
 def pick_device():
@@ -53,26 +59,65 @@ print("Device:", DEVICE)
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
+def find_split_dir(split):
+    """Folder with the jpgs of a split. Default Kaggle layout first, then a search (mount path / nesting can differ)."""
+    p = BDD_DIR / "bdd100k" / "bdd100k" / "images" / "100k" / split
+    if p.is_dir():
+        return p
+    hits = sorted(h for h in BDD_DIR.glob(f"**/images/100k/{split}") if h.is_dir())
+    if not hits:
+        raise FileNotFoundError(f"images/100k/{split} not found under {BDD_DIR}")
+    return hits[0]
+
+
+def find_labels_json(split):
+    name = f"bdd100k_labels_images_{split}.json"
+    p = BDD_DIR / "bdd100k_labels_release" / "bdd100k" / "labels" / name
+    if p.is_file():
+        return p
+    hits = sorted(BDD_DIR.glob(f"**/{name}"))
+    if not hits:
+        raise FileNotFoundError(f"{name} not found under {BDD_DIR}")
+    return hits[0]
+
+
 class BDDDataset(torch.utils.data.Dataset):
     """BDD100K split read lazily: JPEG decode + crop + resize + mask rasterisation happen in the DataLoader workers."""
 
     def __init__(self, split, n=None):
         cv2.setNumThreads(0)                               # inherited by the forked workers: avoids CPU oversubscription
-        self.root = BDD_DIR / "bdd100k" / "bdd100k" / "images" / "100k" / split
+        self.root = find_split_dir(split)
         t = time.time()
-        with open(BDD_DIR / "bdd100k_labels_release" / "bdd100k" / "labels" / f"bdd100k_labels_images_{split}.json") as f:
+        with open(find_labels_json(split)) as f:
             items = json.load(f)
         print(f"{split}: labels json loaded in {fmt_time(time.time() - t)} ({len(items)} images)", flush=True)
         items = [{"name": it["name"],
                 "attributes": it.get("attributes", {}),
                 "labels": [l for l in it["labels"] if l["category"] == "drivable area"]} for it in items]
-        self.paths = {p.name: p for p in self.root.rglob("*.jpg")}
-        print(f"{split}: {len(self.paths)} jpg files found under {self.root}", flush=True)
+
+        # The Kaggle mirror splits 100k/train into subfolders (trainA, trainB, testA, testB). They are ALL train images:
+        # the split is defined by the 100k/<split> folder + its labels json, never by the subfolder name. So: recursive
+        # search under the split folder only, indexed by file name (the json "name" has no folder).
+        self.paths, dup = {}, 0
+        for p in self.root.rglob("*.jpg"):
+            dup += p.name in self.paths
+            self.paths[p.name] = p
+        subdirs = sorted({str(p.parent.relative_to(self.root)) for p in self.paths.values()})
+        print(f"{split}: {len(self.paths)} jpg files under {self.root} | subfolders: {subdirs}", flush=True)
+        if dup:
+            print(f"{split}: WARNING {dup} duplicated file names across subfolders (last one wins)", flush=True)
+
         ok = [it for it in items if it["labels"] and it["name"] in self.paths]
-        day = [it for it in ok if it["attributes"].get("timeofday") == "daytime"]
-        print(f"{split}: {len(ok)} with polygons+file, {len(day)} daytime", flush=True)
-        random.Random(SEED).shuffle(day)       # json order is not random: shuffle before cutting to n
-        self.items = day[:n]
+        sel = [it for it in ok if not ONLY_DAYTIME or it["attributes"].get("timeofday") == "daytime"]
+        weather = {}
+        for it in sel:
+            w = it["attributes"].get("weather", "undefined")
+            weather[w] = weather.get(w, 0) + 1
+        sel = [it for it in sel if it["attributes"].get("weather", "undefined") not in EXCLUDE_WEATHER]
+        print(f"{split}: {len(ok)} with polygons+file | weather before filter {weather} | "
+              f"kept {len(sel)} (daytime={ONLY_DAYTIME}, excluded weather={sorted(EXCLUDE_WEATHER)})", flush=True)
+        random.Random(SEED).shuffle(sel)       # json order is not random: shuffle before cutting to n
+        self.items = sel[:n]
         print(f"{split}: {len(self.items)} usable images", flush=True)
 
     def __len__(self):
@@ -225,6 +270,9 @@ def train(epochs=60, batch=8, val_frac=0.2, lr=3e-4):
     device = pick_device()
     print("Training device:", device)
     files = list_images()
+    if not files:
+        raise FileNotFoundError(f"No KITTI images in {ROOT}/training/image_2: train() is the KITTI training. "
+                                "For BDD100K use train_road().")
     rng = np.random.default_rng(SEED)
     rng.shuffle(files)
     n_val = int(len(files) * val_frac)
@@ -399,7 +447,10 @@ def train_ego(epochs=25, batch=32, lr=3e-4, print_every=10, n_images=None):
     """Train the U-Net on BDD100K in perspective: channel 0 = drivable (direct+alt), channel 1 = ego lane (direct)."""
     dl = lambda split, **kw: torch.utils.data.DataLoader(BDDDataset(split, n_images), batch_size=batch, num_workers=4, pin_memory=True, **kw)
     train_dl = dl("train", shuffle=True, drop_last=True, persistent_workers=True)
-    val_dl = torch.utils.data.DataLoader(BDDDataset("val", 2000), batch_size=batch, num_workers=4, pin_memory=True)
+    val_ds = BDDDataset("val", 2000)
+    val_dl = torch.utils.data.DataLoader(val_ds, batch_size=batch, num_workers=4, pin_memory=True)
+    leak = {it["name"] for it in train_dl.dataset.items} & {it["name"] for it in val_ds.items}
+    assert not leak, f"{len(leak)} images are both in train and val"
     n_batches = len(train_dl)
     torch.manual_seed(SEED)
     net = UNetR18().to(DEVICE)
@@ -452,6 +503,12 @@ def train_ego(epochs=25, batch=32, lr=3e-4, print_every=10, n_images=None):
         torch.save({k: v.cpu() for k, v in net.state_dict().items()}, EGO_PATH)   # checkpoint every epoch
 
 
+def train_road(epochs=25, batch=32, lr=3e-4, print_every=10, n_images=None):
+    """Train the road mask (channel 0 = drivable area, channel 1 = ego lane) on BDD100K and save NET_PATH (road_net.pt)."""
+    train_ego(epochs, batch, lr, print_every, n_images)
+    print("saved:", NET_PATH)
+
+
 @torch.no_grad()
 def eval_ego_kitti(net_path=EGO_PATH):
     """Ego-lane IoU of a BDD-trained net on the KITTI images that have lane GT (um_*), perspective view."""
@@ -483,9 +540,9 @@ def load_net(path=NET_PATH):
     return _nets[path]
 
 @torch.no_grad()
-def road_prob_bev(img_bird_eye, valid_bev, net=None):
-    net = net or load_net()
-    p = torch.sigmoid(net(to_tensor(img_bird_eye).to(INFER_DEVICE))[0, 0]).numpy()
+def road_prob_bev(img, M, valid_bev):
+    """Road probability: net on the ORIGINAL image (perspective, IMG_SIZE, trained on BDD100K), then warped into the BEV."""
+    p = cv2.warpPerspective(road_prob_img(img), M, valid_bev.shape[::-1])
     p[~valid_bev] = 0
     return p
 
@@ -496,10 +553,10 @@ def ego_prob_bev(img, M, valid_bev):
     p[~valid_bev] = 0
     return p
 
-def road_mask_bev(img_bird_eye, valid_bev, net=None):
+def road_mask_bev(img, M, valid_bev):
     """Road mask (uint8 0/255) in the BEV: threshold, cleaning, ego component, filled holes, smooth border."""
     h, w = valid_bev.shape
-    mask = (road_prob_bev(img_bird_eye, valid_bev, net) > ROAD_THR).astype(np.uint8) * 255
+    mask = (road_prob_bev(img, M, valid_bev) > ROAD_THR).astype(np.uint8) * 255
 
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)     # removes isolated blobs (bright grass, etc.)
@@ -549,12 +606,20 @@ def chroma_edges(img_bev, valid_bev, min_grad=CHROMA_MIN, percentile=97, block=6
 
 
 @torch.no_grad()
-def ego_prob_img(img):
-    """Ego-lane probability at the ORIGINAL image resolution (the net runs at IMG_SIZE)."""
+def _prob_img(img, channel):
+    """Probability of one output channel at the ORIGINAL image resolution (the net runs at IMG_SIZE)."""
     h, w = img.shape[:2]
     small = cv2.resize(img, IMG_SIZE, interpolation=cv2.INTER_AREA)
-    p = torch.sigmoid(load_net(EGO_PATH)(to_tensor(small).to(INFER_DEVICE))[0, 1]).numpy()
+    p = torch.sigmoid(load_net(NET_PATH)(to_tensor(small).to(INFER_DEVICE))[0, channel]).numpy()
     return cv2.resize(p, (w, h))
+
+
+def road_prob_img(img):
+    return _prob_img(img, 0)       # channel 0 = drivable area (road)
+
+
+def ego_prob_img(img):
+    return _prob_img(img, 1)       # channel 1 = ego lane
 
 
 if __name__ == "__main__":

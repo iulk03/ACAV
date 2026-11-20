@@ -8,6 +8,8 @@ Z_RANGE = (7.0, 20.0)
 PX_PER_M = 30
 GAUSS_KSIZE = 5
 
+import obstacle_detection as od  # imported after BEV constants to avoid partial-init import issues
+
 EGO_MIN_AREA_PX = 3000      # smaller ego mask -> considered missing
 EGO_IN_ROAD_MIN = 0.9       # fraction of the ego mask that must lie inside the road mask
 ROAD_KEEP_PX = 6            # the road mask is widened by this many px before filtering the line centres (0.2 m at 30 px/m)
@@ -160,7 +162,7 @@ def line_bev_pipeline(img_bev, valid_bev):
     return dict(gray=gray, blur=blur, resp=resp, edges=edges)
 
 
-def lane_pipeline(path, img, out_path=None):
+def lane_pipeline(path, img, out_path=None, raw_dets=None):
     calib = read_calib(path)
     trapezoid = compute_trapezoid(calib)
     img_roi = apply_roi(img, trapezoid)
@@ -168,10 +170,18 @@ def lane_pipeline(path, img, out_path=None):
     size = (img_bird_eye.shape[1], img_bird_eye.shape[0])
     valid_bev = valid_bev_mask(img.shape, M, size)
 
+    # Maschere ostacoli in BEV (corpo 2D warpato + impronta fisica a terra)
+    obs_body_bev, obs_ground_bev, obs_boxes = od.build_obstacle_bev_masks(
+        raw_dets or [],
+        M,
+        (img_bird_eye.shape[0], img_bird_eye.shape[1]),
+        img.shape,
+    )
+
     steps = line_bev_pipeline(img_bird_eye, valid_bev)
         
     # 1) road mask from the U-Net: keep only the edges inside the (widened) road
-    road_mask = nc.road_mask_bev(img_bird_eye, valid_bev)
+    road_mask = nc.road_mask_bev(img, M, valid_bev)
     if road_mask.any():
         road_keep = widen_mask(road_mask, valid_bev, px=ROAD_KEEP_PX)
     else:                                        # net failed: do not wipe out every edge
@@ -183,11 +193,16 @@ def lane_pipeline(path, img, out_path=None):
     guide["bev"] = img_bird_eye
     guide["road"] = road_mask          # used by lane_fitting to check the chosen lane against the road
     guide["valid"] = valid_bev
+    guide["obs_body"] = obs_body_bev
+    guide["obs_ground"] = obs_ground_bev
+    guide["obs_boxes"] = obs_boxes
 
-    # 2) line centres inside the road: these pixels become the RANSAC points
+    # 2) line centres inside the road, excluding vehicle reflections/edges: RANSAC/voting points
     img_thresh = cv2.bitwise_and(steps["edges"], road_keep)
+    if obs_body_bev.any():
+        img_thresh = cv2.bitwise_and(img_thresh, cv2.bitwise_not(obs_body_bev))
 
-    steps.update(road_keep=road_keep, ego=ego_mask, final=img_thresh)
+    steps.update(road_keep=road_keep, ego=ego_mask, obs_body=obs_body_bev, final=img_thresh)
     if out_path is not None:
         plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path)
     return M, M_inv, img_thresh, guide
@@ -198,16 +213,17 @@ def plot_pipeline_steps(img, img_bird_eye, trapezoid, steps, out_path=None):
     cv2.polylines(vis, [trapezoid.astype("int32")], True, (255, 0, 0), 3)
 
     road_ov = img_bird_eye.copy()
-    for key, color in (("road_keep", (0, 255, 0)), ("ego", (0, 191, 255))):   # RGB: green road, light blue ego
-        m = steps[key] > 0
-        road_ov[m] = (0.6 * road_ov[m] + 0.4 * np.array(color)).astype(np.uint8)
+    for key, color in (("road_keep", (0, 255, 0)), ("ego", (0, 191, 255)), ("obs_body", (255, 60, 60))):
+        if key in steps and steps[key] is not None:
+            m = steps[key] > 0
+            road_ov[m] = (0.6 * road_ov[m] + 0.4 * np.array(color)).astype(np.uint8)
     panels = [
         ("1. Original + ROI", vis, None),
         ("2. Bird-eye", img_bird_eye, None),
         ("3. Gaussian blur", steps["blur"], "gray"),
         ("4. Line response", steps["resp"], "gray"),
         ("5. Line centres", steps["edges"], "gray"),
-        ("6. U-Net road (green) + ego (blue)", road_ov, None),
+        ("6. Road (green) + ego (blue) + obs (red)", road_ov, None),
         ("7. Final", steps["final"], "gray"),
     ]
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))        
