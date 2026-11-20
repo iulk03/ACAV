@@ -8,6 +8,7 @@ import numpy as np
 import lane_fitting as lf
 import lane_pipeline as lp
 import obstacle_detection as od
+import net_classifier as nc
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -37,9 +38,9 @@ TYPE = 0        # 0 = um, 1 = umm, 2 = uu
 ALL = True      # True to process all the images (um, umm, uu)
 DEBUG = not ALL and SINGLE is not None   # full debug images only when few images are processed
 wrong = {
-    "um": [12, 43, 44, 45],
+    "um": [12, 44],
     "umm": [13, 45],
-    "uu": [6, 7, 8, 17, 27, 29, 59, 69, 71, 92, 93, 94, 97],
+    "uu": [6, 7, 17, 27, 69, 71, 92, 94, 97],
 }
 
 marks = {}          # type -> [(img_idx, interior marking support)]
@@ -70,6 +71,42 @@ def ego_width_stats():
         d = np.array([r[1] - r[2] for r in res])
         print(f"[{img_type}] near-far: mean {d.mean():+.2f} m, median {np.median(d):+.2f} m, {(d > 1.0).sum()}/{len(d)} with near wider than far by >1 m")
         print(f"[{img_type}] narrowing = {[r[0] for r in res if r[1] - r[2] > 1.0]}")
+
+
+def border_bias_stats():
+    """For every image in `wrong`: BEV metres, + = right of the GT road. Separates the U-Net road mask error from the lane error.
+    mask R / mask IoU : right border of the road mask vs the GT road, and mask-vs-GT IoU
+    lane R            : right lane border vs the right GT road edge
+    lane L vs centre  : left lane border vs the centre of the GT road"""
+    def edges(mask):
+        left = np.argmax(mask, 1)
+        right = mask.shape[1] - 1 - np.argmax(mask[:, ::-1], 1)
+        to_m = lambda c: lp.X_RANGE[0] + (c + 0.5) / lp.PX_PER_M
+        return mask.any(1), to_m(left), to_m(right)
+
+    for img_type in OPTIONS:
+        files = sorted(glob.glob(f"{ROOT}/{SET}/image_2/{img_type}_*.png"))
+        for idx in wrong[img_type]:
+            f = Path(files[idx])
+            img = cv2.cvtColor(cv2.imread(str(f)), cv2.COLOR_BGR2RGB)
+            M, M_inv, thresh, guide = lp.lane_pipeline(ROOT / SET / "calib" / f"{f.stem}.txt", img,
+                                                       raw_dets=detector.detect(img))
+            out = lf.lane_fitting(thresh, img, M_inv, guide)
+            _, road, valid, _, _ = nc.bev_data(f)
+            gt, pred = road & valid, (guide["road"] > 0) & valid
+            rows_gt, gt_l, gt_r = edges(gt)
+            rows_p, _, m_r = edges(pred)
+            ok = rows_gt & rows_p
+            if not ok.any():
+                print(f"  {img_type} {idx}: empty mask or GT")
+                continue
+            line = lf.mask_border_line(guide["road"], "right", obs_body=guide["obs_body"])
+            txt = f"  {img_type} {idx}: mask R {np.median((m_r - gt_r)[ok]):+.2f} m, mask IoU {(gt & pred).sum() / max((gt | pred).sum(), 1):.2f}"
+            txt += ", mask-line R " + ("none" if line is None else f"{np.median((line['a'] * lf._Z_ROW + line['b'] - gt_r)[ok]):+.2f} m")
+            if "curved" in out:
+                x_l, x_r = (lf.boundary_x(c) for c in out["curved"])
+                txt += f", lane R {np.median((x_r - gt_r)[ok]):+.2f} m, lane L vs centre {np.median((x_l - 0.5 * (gt_l + gt_r))[ok]):+.2f} m, alt {out.get('alt')}"
+            print(txt)
 
 
 def report():
@@ -107,6 +144,12 @@ def execute(img_idx, img_type):
     # ---- 3) Valutazione ostacoli rispetto alla corsia predetta ----
     obstacles = od.evaluate_obstacles(raw_dets, M, curved=out.get("curved"))
     out["obstacles"] = obstacles
+    gt = nc.lane_gt(image_path)                    # None when the image has no ego-lane GT
+    if gt is not None and "pred_mask" in out:
+        lane, valid = gt
+        roi = lp.apply_roi(np.full(img.shape[:2], 255, np.uint8), lp.compute_trapezoid(lp.read_calib(calib_path))) > 0
+        g, p = lane & valid & roi, out["pred_mask"] & roi      # IoU only inside the BEV window (z 7-20 m)
+        print(f"  lane IoU (ROI): {(g & p).sum() / max((g | p).sum(), 1):.2f}")
     in_lane_obs = [o for o in obstacles if o["in_ego_lane"]]
 
     if DEBUG:
@@ -163,5 +206,5 @@ else:
     else:
         execute(SINGLE, type)
 
-
+# border_bias_stats()
 report()
