@@ -53,7 +53,7 @@ MASK_EDGE_MARGIN_PX = 4     # border columns closer than this to the BEV side ar
 MASK_MIN_ROWS = 40          # min number of rows with a valid border point
 
 
-CAR_TOL_M = 0.3             # car (x=0) must lie between the two lines, within this tolerance
+CAR_TOL_M = 0.50            # car (x=0) must lie between the two lines, within this tolerance
 W_SUPPORT_CAP = 220.0       # cap on the weighted inlier support of a single line
 W_GUIDE = 80.0              # penalty per metre of disagreement with the guide border (lane guide only)
 GUIDE_TOL_M = 0.6           # max distance for a candidate to be considered "matching" a guide border
@@ -66,7 +66,7 @@ ROAD_GOOD_FRAC = 0.85       # un'alternativa "buona" deve avere almeno questa fr
 ROAD_GAIN_GOOD = 0.10       # ...e migliorare di almeno questo rispetto alla scelta originale
 ROAD_GAIN_ANY = 0.20        # se nessuna arriva a ROAD_GOOD_FRAC: la migliore passa solo con questo guadagno
 ROAD_OK_FRAC_STRONG = 0.50  # soglia piu' bassa per una coppia di linee vere e ben supportate: non la si sostituisce con bordi maschera
-STRONG_PAIR_SUPPORT = 100.0 # supporto pesato minimo di ciascuna delle due linee per considerare la coppia "forte" (come MARKING_MIN_SUPPORT, NON calibrato)
+STRONG_PAIR_SUPPORT = 100.0 # supporto pesato minimo di ciascuna delle due linee per considerare la coppia "forte"
 
 # ---------------- guida ego troppo larga ----------------
 EGO_GUIDE_MAX_W_M = 6.0     # se la maschera ego e' piu' larga (mediana per riga) non e' una corsia: la guida viene declassata a strada,
@@ -295,17 +295,26 @@ def pair_score(l, r, gl=None, gr=None, reject=GUIDE_REJECT_M, obs_boxes=()):
     cl, cr = x_car(l), x_car(r)
     if not car_inside(l, r):
         return -np.inf
-    if gl is not None and abs(xl - x_at(gl)) > reject:
+
+    # Se la maschera ego copre tutta la carreggiata (> 4.2 m), consenti di dividerla
+    # solo se la striscia interna ha supporto molto forte e sta ben dentro i bordi
+    wide_guide = guided and (x_at(gr) - x_at(gl) > LANE_W_MAX)
+    split_l = wide_guide and l["w_inl"] >= 130.0 and (x_at(gl) + 1.2 < xl < x_at(gr) - 1.2)
+    split_r = wide_guide and r["w_inl"] >= 130.0 and (x_at(gl) + 1.2 < xr < x_at(gr) - 1.2)
+    check_gl = gl is not None and not split_l
+    check_gr = gr is not None and not split_r
+
+    if check_gl and abs(xl - x_at(gl)) > reject:
         return -np.inf
-    if gr is not None and abs(xr - x_at(gr)) > reject:
+    if check_gr and abs(xr - x_at(gr)) > reject:
         return -np.inf
     support = min(l["w_inl"], W_SUPPORT_CAP) + min(r["w_inl"], W_SUPPORT_CAP)
     penalty = W_CENTER * abs(0.5 * (cl + cr))
-    if not guided:
+    if not guided or split_l or split_r:
         penalty += W_WIDTH * abs(larg - LANE_WIDTH_M)
-    if gl is not None:
+    if check_gl:
         penalty += W_GUIDE * abs(xl - x_at(gl))
-    if gr is not None:
+    if check_gr:
         penalty += W_GUIDE * abs(xr - x_at(gr))
     penalty += obstacle_penalty(l, r, obs_boxes)
     return support - penalty
@@ -481,15 +490,15 @@ def lane_road_frac(l, r, pts, road, valid):
     return float((lane & (road > 0)).sum() / area)
 
 
-def lane_from_road(road, width=LANE_WIDTH_M, obs_body=None):
+def lane_from_road(road, width=LANE_WIDTH_M, obs_body=None, full_road=True):
     gl = mask_border_line(road, "left", obs_body=obs_body)
     gr = mask_border_line(road, "right", obs_body=obs_body)
     mk = lambda l: dict(a=l["a"], b=l["b"], inliers=None, n_iter=0, stimata=True, source="road")
     if gl is not None and gr is not None:
         road_w = x_at(gr) - x_at(gl)
-        if road_w <= LANE_W_MAX:
+        if full_road or road_w <= LANE_W_MAX:
             return mk(gl), mk(gr)
-        # Strada più larga di una corsia: scegliere il bordo più vicino all'auto (x=0)
+        # Strada più larga di una corsia con marcature interne: scegliere il bordo più vicino all'auto (x=0)
         if abs(x_at(gl)) < abs(x_at(gr)):
             # Bordo sinistro più vicino → usa quello come riferimento
             left = mk(gl)
@@ -513,7 +522,8 @@ def lane_from_road(road, width=LANE_WIDTH_M, obs_body=None):
         return left, right
     return None
 
-def road_alternatives(cands, pair, gl, gr, road, obs_body=None, obs_boxes=()):
+
+def road_alternatives(cands, pair, gl, gr, road, obs_body=None, obs_boxes=(), no_marks=True):
     """Alternative alla scelta originale, nell'ordine: (1) altre coppie valide, (2) una candidata con il lato
     mancante da bordo maschera / default / lato opposto, (3) corsia dalla sola road_mask.
     Ogni elemento: (nome, sinistra, destra, stimata, sel)."""
@@ -550,7 +560,7 @@ def road_alternatives(cands, pair, gl, gr, road, obs_body=None, obs_boxes=()):
                 alts.append((name, res[0], res[1], True, dict(sel)))
 
     # 3) solo road_mask
-    res = lane_from_road(road, obs_body=obs_body)
+    res = lane_from_road(road, obs_body=obs_body, full_road=no_marks)
     if res is not None:
         alts.append(("road-only", res[0], res[1], True, dict(left=None, right=None)))
     return alts
@@ -783,7 +793,7 @@ def lane_from_masks(gl, gr, road, obs_body=None):
     if gl is not None and gr is not None:
         mk = lambda l: dict(a=l["a"], b=l["b"], inliers=None, n_iter=0, stimata=True, source="lane")
         return mk(gl), mk(gr), "no-marks:ego"
-    res = lane_from_road(road, obs_body=obs_body)
+    res = lane_from_road(road, obs_body=obs_body, full_road=True)
     if res is not None:
         return res[0], res[1], "no-marks:road"
     return None
@@ -880,7 +890,7 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
                            and min(pair[0]["w_inl"], pair[1]["w_inl"]) >= STRONG_PAIR_SUPPORT)
             ok_frac = ROAD_OK_FRAC_STRONG if strong_pair else ROAD_OK_FRAC
             if road_frac < ok_frac:
-                alts = road_alternatives(cands, pair, gl, gr, road, obs_body=obs_body, obs_boxes=obs_boxes)
+                alts = road_alternatives(cands, pair, gl, gr, road, obs_body=obs_body, obs_boxes=obs_boxes, no_marks=no_marks)
                 choice = pick_alternative(alts, road_frac, pts, road, valid, obs_boxes=obs_boxes)
                 if choice is not None:
                     (alt_name, ransac_sx, ransac_dx, stimata, sel), road_frac = choice

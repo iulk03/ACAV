@@ -36,6 +36,7 @@ SINGLE = 'w'
 TYPE = 0        # 0 = um, 1 = umm, 2 = uu
 ALL = True      # True to process all the images (um, umm, uu)
 DEBUG = not ALL and SINGLE is not None   # full debug images only when few images are processed
+DEBUG = True
 wrong = {
     "um": [12, 43, 44, 45],
     "umm": [13, 45],
