@@ -56,7 +56,9 @@ MASK_MIN_ROWS = 40          # min number of rows with a valid border point
 CAR_TOL_M = 0.50            # car (x=0) must lie between the two lines, within this tolerance
 W_SUPPORT_CAP = 220.0       # cap on the weighted inlier support of a single line
 W_GUIDE = 80.0              # penalty per metre of disagreement with the guide border (lane guide only)
-GUIDE_TOL_M = 0.6           # max distance for a candidate to be considered "matching" a guide border
+W_ASYM_GUIDE = 80.0         # penalty when an estimated-side pair has its real line > 2 m from nearest guide border
+GUIDE_TOL_M = 0.6           # max distance for a candidate to be considered "matching" an ego-lane guide border
+ROAD_GUIDE_TOL_M = 1.5      # wider tolerance for road-mask guide borders (borders are less precise than ego-lane)
 GUIDE_REJECT_M = 1.0         # a pair whose border is further than this from the (lane) guide border is rejected outright
 
 
@@ -179,7 +181,18 @@ def car_inside(l, r):
     xr_near = r["a"] * z_near + r["b"]
     xl_mid = 0.5 * (l["b"] + xl_near)
     xr_mid = 0.5 * (r["b"] + xr_near)
-    return (xl_near < CAR_TOL_M and xr_near > -CAR_TOL_M) and (xl_mid < CAR_TOL_M and xr_mid > -CAR_TOL_M)
+    a_mean = 0.5 * (l["a"] + r["a"])
+    tol_l = CAR_TOL_M + max(0.0, 0.5 * a_mean * z_near)
+    tol_r = CAR_TOL_M + max(0.0, -0.5 * a_mean * z_near)
+    return (xl_near < tol_l and xr_near > -tol_r) and (xl_mid < CAR_TOL_M and xr_mid > -CAR_TOL_M)
+
+
+def _is_right_side(line, gl=None, gr=None, a_ref=None):
+    """True if `line` is on the right side of the ego lane (relative to ego guide or road direction at z_mid)."""
+    if gl is not None and gr is not None:
+        return x_at(line) > 0.5 * (x_at(gl) + x_at(gr))
+    z_shift = Z_REF - 0.5 * Z_RANGE[0]
+    return (x_at(line) - (a_ref or 0.0) * z_shift) > 0.0
 
 
 def near_weights(pts):
@@ -215,50 +228,64 @@ W_ROW = near_weights(np.column_stack((np.zeros(N_ROWS), _Z_ROW)))      # peso di
 
 
 def vote_candidates(pts, a_ref, n=N_CANDIDATES):
-    """Candidate lines with the direction FIXED to a_ref (slope of the mask).
+    """Candidate lines with the direction guided by a_ref (slope of the mask).
     u = x - a_ref*z is the lateral position 'straightened' along the road direction: every line parallel to the road
     has a constant u. An histogram of u, counting DISTINCT BEV rows (not points) per bin, gives one peak per line.
     Dashed lines are short but cover many rows; cracks and shadow borders are sinuous, so they spread over many bins.
     """
     if len(pts) < VOTE_MIN_ROWS:
         return []
-    u = pts[:, 0] - a_ref * pts[:, 1]
-    rows = np.clip(np.round((Z_RANGE[1] - pts[:, 1]) * PX_PER_M).astype(int), 0, N_ROWS - 1)
-    u0 = u.min()
-    bins = ((u - u0) / VOTE_BIN_M).astype(int)
-    nb = int(bins.max()) + 1
-
-    occ = np.zeros((nb + 2, N_ROWS), bool)                 # occupied (bin, row) cells, padded by one bin per side
-    occ[bins + 1, rows] = True
-    occ3 = occ[:-2] | occ[1:-1] | occ[2:]                  # tolerance of +-1 bin (+-0.1 m)
-    count = occ3.sum(1)                                    # distinct rows per bin
-    score = (occ3 * W_ROW).sum(1)                          # same, weighted: near rows count more
-    score[count < VOTE_MIN_ROWS] = 0.0
-
-    k = int(round(VOTE_NMS_M / VOTE_BIN_M))
+    rows_all = np.clip(np.round((Z_RANGE[1] - pts[:, 1]) * PX_PER_M).astype(int), 0, N_ROWS - 1)
+    remaining = np.ones(len(pts), dtype=bool)
     cands = []
     for _ in range(n):
+        rem_pts = pts[remaining]
+        if len(rem_pts) < VOTE_MIN_ROWS:
+            break
+        u = rem_pts[:, 0] - a_ref * rem_pts[:, 1]
+        rows = rows_all[remaining]
+        u0 = u.min()
+        bins = ((u - u0) / VOTE_BIN_M).astype(int)
+        nb = int(bins.max()) + 1
+
+        occ = np.zeros((nb + 2, N_ROWS), bool)             # occupied (bin, row) cells, padded by one bin per side
+        occ[bins + 1, rows] = True
+        occ3 = occ[:-2] | occ[1:-1] | occ[2:]              # tolerance of +-1 bin (+-0.1 m)
+        count = occ3.sum(1)                                # distinct rows per bin
+        score = (occ3 * W_ROW).sum(1)                      # same, weighted: near rows count more
+        score[count < VOTE_MIN_ROWS] = 0.0
+
         b = int(np.argmax(score))
         if score[b] <= 0:
             break
-        score[max(0, b - k):b + k + 1] = 0.0               # non-maximum suppression
         u_c = u0 + (b + 0.5) * VOTE_BIN_M
         near = np.abs(u - u_c) <= VOTE_BAND_M
-        sel = pts[near]
+        sel = rem_pts[near]
         a, c = float(a_ref), float(np.median(sel[:, 0] - a_ref * sel[:, 1]))
         tight = sel[np.abs(sel[:, 0] - (a * sel[:, 1] + c)) <= VOTE_REFINE_BAND_M]
         if len(tight) >= MIN_INLIERS and np.ptp(tight[:, 1]) >= VOTE_REFINE_SPAN_M:
             a_fit, c_fit = np.polyfit(tight[:, 1], tight[:, 0], 1)
             if abs(a_fit - a_ref) <= VOTE_REFINE_TOL:
                 a, c = float(a_fit), float(c_fit)
+        elif len(tight) > 0:
+            # Short segment: widen into a narrow cone around tight's centroid to connect disjoint dashes along a gentle curve
+            zc, xc = float(np.mean(tight[:, 1])), float(np.mean(tight[:, 0]))
+            cone = np.abs(rem_pts[:, 0] - (a_ref * (rem_pts[:, 1] - zc) + xc)) <= INLINER_TRESHOLD_M + VOTE_REFINE_TOL * np.abs(rem_pts[:, 1] - zc)
+            r = ransac(rem_pts[cone], slope_ref=a_ref)
+            if r is not None:
+                row_weight = lambda aa, cc: W_ROW[np.unique(rows[line_distance(rem_pts, aa, cc) <= INLINER_TRESHOLD_M])].sum()
+                if row_weight(r["a"], r["b"]) > 1.2 * row_weight(a, c):
+                    a, c = r["a"], r["b"]
         d = line_distance(pts, a, c)
         inl = d <= INLINER_TRESHOLD_M
         if not inl.any():
+            remaining[np.flatnonzero(remaining)[near]] = False
             continue
-        rows_in = np.unique(rows[inl])
-        rows_wide = np.unique(rows[(d <= VOTE_WIDE_M) & (rows >= rows_in.min()) & (rows <= rows_in.max())])   # only along the same z-span
-        straight = len(rows_in) / max(len(rows_wide), 1)       # ~1 for a straight line, <1 for a sinuous crack
+        rows_in = np.unique(rows_all[inl])
+        rows_wide = np.unique(rows_all[(d <= VOTE_WIDE_M) & (rows_all >= rows_in.min()) & (rows_all <= rows_in.max())])   # only along the same z-span
+        straight = len(rows_in) / max(len(rows_wide), 1)   # ~1 for a straight line, <1 for a sinuous crack
         cands.append(dict(a=a, b=c, inliers=inl, n_iter=0, w_inl=float(W_ROW[rows_in].sum()) * straight ** 2))
+        remaining &= d > VOTE_NMS_M
     return cands
 
 
@@ -308,7 +335,7 @@ def pair_score(l, r, gl=None, gr=None, reject=GUIDE_REJECT_M, obs_boxes=()):
         return -np.inf
     if check_gr and abs(xr - x_at(gr)) > reject:
         return -np.inf
-    support = min(l["w_inl"], W_SUPPORT_CAP) + min(r["w_inl"], W_SUPPORT_CAP)
+    support = min(l.get("w_inl", 0.0), W_SUPPORT_CAP) + min(r.get("w_inl", 0.0), W_SUPPORT_CAP)
     penalty = W_CENTER * abs(0.5 * (cl + cr))
     if not guided or split_l or split_r:
         penalty += W_WIDTH * abs(larg - LANE_WIDTH_M)
@@ -316,6 +343,12 @@ def pair_score(l, r, gl=None, gr=None, reject=GUIDE_REJECT_M, obs_boxes=()):
         penalty += W_GUIDE * abs(xl - x_at(gl))
     if check_gr:
         penalty += W_GUIDE * abs(xr - x_at(gr))
+    # Penalize pairs where one side is estimated and the real side is > 2 m from the nearest guide border
+    refs = [g for g in (gl, gr) if g is not None]
+    if refs and (l.get("stimata") or r.get("stimata")):
+        real_x = xr if l.get("stimata") else xl
+        if min(abs(real_x - x_at(g)) for g in refs) > 2.0:
+            penalty += W_ASYM_GUIDE
     penalty += obstacle_penalty(l, r, obs_boxes)
     return support - penalty
 
@@ -332,22 +365,44 @@ def best_pair(cands, gl=None, gr=None, reject=GUIDE_REJECT_M, obs_boxes=()):
     return best
 
 
-def pick_anchor(cands, gl, gr):
-    """Candidate used when no valid pair exists: the one closest to a guide border, else the strongest."""
+def pick_anchor(cands, gl, gr, road_gl=None, road_gr=None):
+    """Candidate used when no valid pair exists: closest to ego guide border (tol 0.6m),
+    else closest to road guide border (tol 1.5m) or inside road borders, else nearest to the car."""
     refs = [g for g in (gl, gr) if g is not None]
     if refs:
         scored = [(min(abs(x_at(c) - x_at(g)) for g in refs), c) for c in cands]
         scored = [t for t in scored if t[0] < GUIDE_TOL_M]
         if scored:
             return min(scored, key=lambda t: t[0])[1]
+    road_refs = [g for g in (road_gl, road_gr) if g is not None]
+    if road_refs:
+        # On multi-lane roads, ignore road borders far from the car (e.g. opposite lane edge)
+        if road_gl is not None and road_gr is not None and (x_at(road_gr) - x_at(road_gl)) > LANE_W_MAX:
+            road_refs = [min(road_refs, key=lambda g: abs(x_at(g)))]
+        near_cands = [c for c in cands if abs(x_at(c)) <= MAX_CAND_DIST_FROM_CAR] or cands
+        scored = [(min(abs(x_at(c) - x_at(g)) for g in road_refs), c) for c in near_cands]
+        scored = [t for t in scored if t[0] < ROAD_GUIDE_TOL_M]
+        if scored:
+            return min(scored, key=lambda t: t[0])[1]
     strong = [c for c in cands if c["w_inl"] >= 0.25 * max(d["w_inl"] for d in cands)]   # ignore weak cracks
+    if road_gl is not None or road_gr is not None:
+        inside = [
+            c for c in strong
+            if (road_gl is None or x_at(c) >= x_at(road_gl))
+            and (road_gr is None or x_at(c) <= x_at(road_gr))
+            and abs(x_at(c)) <= MAX_CAND_DIST_FROM_CAR
+        ]
+        if inside:
+            return min(inside, key=lambda c: abs(x_at(c)))
     return min(strong, key=lambda c: abs(x_at(c)))                                       # nearest to the car
 
 
-def missing_side(line, width=LANE_WIDTH_M, flip=False):
+def missing_side(line, width=LANE_WIDTH_M, flip=False, is_right=None):
     """Lato mancante a distanza `width`. Di default sul lato verso l'auto; flip=True -> sul lato opposto."""
     est = dict(a=line["a"], b=None, inliers=None, n_iter=0, stimata=True)
-    if (x_at(line) > 0) != flip:
+    if is_right is None:
+        is_right = x_at(line) > 0
+    if is_right != flip:
         est["b"] = line["b"] - width
         return est, line
     est["b"] = line["b"] + width
@@ -419,11 +474,11 @@ def road_direction(guide):
     return float(np.average([l["a"] for l in ls], weights=w))
 
 
-def missing_side_from_guide(line, guide):
+def missing_side_from_guide(line, guide, is_right=None):
     """Other lane border taken from the mask edge. Returns (left, right) or None."""
     if guide is None or guide.get("mask") is None:
         return None
-    known_is_right = x_at(line) > 0
+    known_is_right = (x_at(line) > 0) if is_right is None else is_right
     obs_body = guide.get("obs_body")
     edge = mask_border_line(guide["mask"], "left" if known_is_right else "right", obs_body=obs_body)
     if edge is None:
@@ -523,7 +578,7 @@ def lane_from_road(road, width=LANE_WIDTH_M, obs_body=None, full_road=True):
     return None
 
 
-def road_alternatives(cands, pair, gl, gr, road, obs_body=None, obs_boxes=(), no_marks=True):
+def road_alternatives(cands, pair, gl, gr, road, obs_body=None, obs_boxes=(), no_marks=True, pts=None, valid=None, a_ref=None):
     """Alternative alla scelta originale, nell'ordine: (1) altre coppie valide, (2) una candidata con il lato
     mancante da bordo maschera / default / lato opposto, (3) corsia dalla sola road_mask.
     Ogni elemento: (nome, sinistra, destra, stimata, sel)."""
@@ -548,21 +603,28 @@ def road_alternatives(cands, pair, gl, gr, road, obs_body=None, obs_boxes=(), no
 
     # 2) candidata singola, lato mancante in tre modi
     road_guide = dict(mask=road, source="road", obs_body=obs_body)
+    deferred_defaults = []
     for i in sorted(range(len(cands)), key=lambda k: -cands[k]["w_inl"]):
         c = cands[i]
-        side = "right" if x_at(c) > 0 else "left"
+        is_right = _is_right_side(c, gl, gr, a_ref)
+        side = "right" if is_right else "left"
         sel = dict(left=None, right=None)
         sel[side] = i
-        for name, res in (("single+mask", missing_side_from_guide(c, road_guide)),
-                          ("single+default", missing_side(c)),
-                          ("single+flip", missing_side(c, flip=True))):
+        for name, res in (("single+mask", missing_side_from_guide(c, road_guide, is_right=is_right)),
+                          ("single+default", missing_side(c, is_right=is_right)),
+                          ("single+flip", missing_side(c, flip=True, is_right=is_right))):
             if res is not None:
-                alts.append((name, res[0], res[1], True, dict(sel)))
+                if (name == "single+default" and pts is not None and valid is not None
+                        and lane_road_frac(res[0], res[1], pts, road, valid) < ROAD_OK_FRAC):
+                    deferred_defaults.append((name, res[0], res[1], True, dict(sel)))
+                else:
+                    alts.append((name, res[0], res[1], True, dict(sel)))
 
-    # 3) solo road_mask
+    # 3) solo road_mask (prima dei single+default con road_frac < ROAD_OK_FRAC)
     res = lane_from_road(road, obs_body=obs_body, full_road=no_marks)
     if res is not None:
         alts.append(("road-only", res[0], res[1], True, dict(left=None, right=None)))
+    alts.extend(deferred_defaults)
     return alts
 
 
@@ -585,6 +647,19 @@ def pick_alternative(alts, f0, pts, road, valid, obs_boxes=()):
         if f_eff - f0 >= ROAD_GAIN_ANY:
             return a, f
     return None
+
+
+def _anchor_pair_plausible(sx, dx, gl, gr, road_gl, road_gr):
+    """Sanity check: lane center of an anchor + estimated side must stay within a reasonable band
+    around the ego guide center (or inside the road borders when only road mask is available)."""
+    lane_mid = 0.5 * (x_at(sx) + x_at(dx))
+    if gl is not None and gr is not None:
+        g_mid = 0.5 * (x_at(gl) + x_at(gr))
+        g_w = x_at(gr) - x_at(gl)
+        return abs(lane_mid - g_mid) <= max(1.5, 0.35 * g_w)
+    if road_gl is not None and road_gr is not None:
+        return x_at(road_gl) <= lane_mid <= x_at(road_gr)
+    return True
 
 
 def _index(cands, c):
@@ -827,9 +902,10 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
     if not cands and a_ref is not None:                 # rete di sicurezza: direzione sbagliata -> senza vincolo
         cands = find_candidates(pts)
 
-    # Filtrare candidate troppo lontane dal veicolo quando la guida ego è affidabile
+    # Filtrare candidate troppo lontane dalla guida ego (o dal veicolo lungo a_ref) quando la guida ego è affidabile
     if guide is not None and guide.get("source") == "lane" and not ego_wide and cands:
-        cands = [c for c in cands if abs(x_at(c)) <= MAX_CAND_DIST_FROM_CAR]
+        ref_x = 0.5 * (x_at(gl) + x_at(gr)) if (gl is not None and gr is not None) else (a_ref or 0.0) * Z_REF
+        cands = [c for c in cands if abs(x_at(c) - ref_x) <= MAX_CAND_DIST_FROM_CAR]
 
     # ---- gate: ci sono marcature dentro la strada? Se no, si usa un cordolo forte o le maschere ----
     msup = marking_support(img_tresh, road, a_ref, obs_ground=obs_ground) if have_road else None
@@ -866,20 +942,42 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
             ransac_sx, ransac_dx = pair
             sel = dict(left=_index(cands, pair[0]), right=_index(cands, pair[1]))
         elif cands:
-            best = pick_anchor(cands, gl, gr)
-            result = missing_side_from_guide(best, guide)
-            if result is None and gl is not None and gr is not None:
-                # Usa il bordo della maschera ego dal lato mancante
-                known_is_right = x_at(best) > 0
-                edge = gl if known_is_right else gr
-                width_check = abs(x_at(best) - x_at(edge))
-                if LANE_W_MIN < width_check < LANE_W_MAX:
-                    est = dict(a=edge["a"], b=edge["b"], inliers=None, n_iter=0, stimata=True, source="lane")
-                    result = (est, best) if known_is_right else (best, est)
-            if result is None:
-                result = missing_side(best)
-            ransac_sx, ransac_dx = result
-            sel["right" if x_at(best) > 0 else "left"] = _index(cands, best)
+            road_gl = mask_border_line(road, "left", obs_body=obs_body) if have_road else None
+            road_gr = mask_border_line(road, "right", obs_body=obs_body) if have_road else None
+            remaining = list(cands)
+            chosen_best = chosen_res = first_attempt = None
+            while remaining:
+                best = pick_anchor(remaining, gl, gr, road_gl=road_gl, road_gr=road_gr)
+                known_is_right = _is_right_side(best, gl, gr, a_ref)
+                result = missing_side_from_guide(best, guide, is_right=known_is_right)
+                if result is None and gl is not None and gr is not None:
+                    # Usa il bordo della maschera ego dal lato mancante
+                    edge = gl if known_is_right else gr
+                    width_check = abs(x_at(best) - x_at(edge))
+                    if LANE_W_MIN < width_check < LANE_W_MAX:
+                        est = dict(a=edge["a"], b=edge["b"], inliers=None, n_iter=0, stimata=True, source="lane")
+                        result = (est, best) if known_is_right else (best, est)
+                if result is None:
+                    result = missing_side(best, is_right=known_is_right)
+                if first_attempt is None:
+                    first_attempt = (best, result)
+                if _anchor_pair_plausible(result[0], result[1], gl, gr, road_gl, road_gr):
+                    chosen_best, chosen_res = best, result
+                    break
+                remaining = [c for c in remaining if c is not best]
+
+            if chosen_res is None:
+                road_res = lane_from_road(road, obs_body=obs_body, full_road=no_marks) if have_road else None
+                if road_res is not None:
+                    ransac_sx, ransac_dx = road_res
+                    alt_name = "anchor-rejected:road"
+                else:
+                    chosen_best, chosen_res = first_attempt
+                    ransac_sx, ransac_dx = chosen_res
+                    sel["right" if _is_right_side(chosen_best, gl, gr, a_ref) else "left"] = _index(cands, chosen_best)
+            else:
+                ransac_sx, ransac_dx = chosen_res
+                sel["right" if _is_right_side(chosen_best, gl, gr, a_ref) else "left"] = _index(cands, chosen_best)
             stimata = True
 
         # ---- verifica sulla road_mask: se la corsia scelta sta (quasi) tutta sulla strada non cambia nulla ----
@@ -890,7 +988,7 @@ def lane_fitting(img_tresh, img, M_inv, guide=None):
                            and min(pair[0]["w_inl"], pair[1]["w_inl"]) >= STRONG_PAIR_SUPPORT)
             ok_frac = ROAD_OK_FRAC_STRONG if strong_pair else ROAD_OK_FRAC
             if road_frac < ok_frac:
-                alts = road_alternatives(cands, pair, gl, gr, road, obs_body=obs_body, obs_boxes=obs_boxes, no_marks=no_marks)
+                alts = road_alternatives(cands, pair, gl, gr, road, obs_body=obs_body, obs_boxes=obs_boxes, no_marks=no_marks, pts=pts, valid=valid, a_ref=a_ref)
                 choice = pick_alternative(alts, road_frac, pts, road, valid, obs_boxes=obs_boxes)
                 if choice is not None:
                     (alt_name, ransac_sx, ransac_dx, stimata, sel), road_frac = choice

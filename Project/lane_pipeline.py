@@ -12,7 +12,7 @@ import obstacle_detection as od  # imported after BEV constants to avoid partial
 
 EGO_MIN_AREA_PX = 3000      # smaller ego mask -> considered missing
 EGO_IN_ROAD_MIN = 0.9       # fraction of the ego mask that must lie inside the road mask
-ROAD_KEEP_PX = 6            # the road mask is widened by this many px before filtering the line centres (0.2 m at 30 px/m)
+ROAD_KEEP_PX = 10           # the road mask is widened by this many px before filtering the line centres (~0.33 m at 30 px/m)
 
 # ---- bright line detection (signed gradient on log-luminance) ----
 LINE_W_PX = (4, 6, 8)       # allowed line widths (px)  ~0.13-0.27 m at 30 px/m
@@ -95,8 +95,12 @@ def ego_mask_bev(img, M, valid_bev):
     if n <= 1:
         return np.zeros_like(mask)
     seed = lab[h - 10, w // 2]
-    if seed == 0:                                # ego lane must lie under the car: otherwise the net is wrong
-        return np.zeros_like(mask)
+    if seed == 0:                                # fallback in a +-1 m bottom strip when the lane bends at z~7 m
+        strip = lab[max(0, h - 20):h, max(0, w // 2 - PX_PER_M):min(w, w // 2 + PX_PER_M)]
+        vals = strip[strip > 0]
+        if len(vals) == 0:
+            return np.zeros_like(mask)
+        seed = int(np.bincount(vals).argmax())
     keep = seed
     mask = ((lab == keep) * 255).astype(np.uint8)
 

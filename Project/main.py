@@ -38,9 +38,9 @@ ALL = True      # True to process all the images (um, umm, uu)
 DEBUG = not ALL and SINGLE is not None   # full debug images only when few images are processed
 DEBUG = True
 wrong = {
-    "um": [12, 43, 44, 45],
-    "umm": [13, 45],
-    "uu": [6, 7, 8, 17, 27, 29, 59, 69, 71, 92, 93, 94, 97],
+    "um": [44],
+    "umm": [],
+    "uu": [6, 7, 8, 17, 27, 29, 69, 71, 92, 93, 94, 97],
 }
 
 marks = {}          # type -> [(img_idx, interior marking support)]
